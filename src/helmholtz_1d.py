@@ -1,11 +1,14 @@
 import argparse
 import csv
+import math
 import os
+import time
 import warnings
 
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.func import functional_call, grad, jacrev, vmap
 from scipy.fft import dst
 from scipy.integrate import quad
 from scipy.stats import qmc
@@ -16,14 +19,19 @@ from matplotlib.ticker import FuncFormatter, LogLocator, MaxNLocator, NullLocato
 
 torch.set_default_dtype(torch.float64)
 
+
 KPI_SWEEP = [6.5, 6.25, 6.125, 6.0625, 6.03125]
 SAMPLER = "grid"
 N_COLLOCATION = 100
 RESAMPLE = False
-MU = 1000.0
+OPTIMIZER = "lm"
+MU = "auto"
+MU_POWER = 4.0
+MU_EVERY = {"lm": 10, "adam": 100}
 HARD_BC = False
 STRETCH = False
-N_ITER = 15000
+LM_ITER = 3000
+N_ITER = 20000
 LBFGS_ITER = 5000
 LR = 1e-3
 WIDTH = 32
@@ -83,15 +91,19 @@ def l2(values):
     return np.sqrt(np.mean(values**2))
 
 
-def config_tag(mu, hard_bc, stretch):
-    bc = "hard" if hard_bc else f"mu{mu:g}"
-    return f"{bc}_{'stretch' if stretch else 'plain'}"
+def config_tag(mu, hard_bc, stretch, optimizer="adam", mu_auto=False):
+    bc = "hard" if hard_bc else ("muauto" if mu_auto else f"mu{mu:g}")
+    return f"{bc}_{'stretch' if stretch else 'plain'}_{optimizer}"
 
 
-def config_label(mu, hard_bc, stretch, ascii=False):
+def config_label(mu, hard_bc, stretch, optimizer="adam", mu_auto=False, ascii=False):
     m = "mu" if ascii else "μ"
-    bc = "hard BC" if hard_bc else f"weak BC {m} = {mu:g}"
-    return f"{bc}, {'input stretch' if stretch else 'no scaling'}"
+    if hard_bc:
+        bc = "hard BC"
+    else:
+        bc = f"weak BC {m} = " + ("auto" if mu_auto else f"{mu:g}")
+    opt = "LM" if optimizer == "lm" else "Adam + L-BFGS"
+    return f"{bc}, {'input stretch' if stretch else 'no scaling'}, {opt}"
 
 
 def collocation(n_pts, sampler, seed):
@@ -136,9 +148,103 @@ def second_derivative(u, x):
     return torch.autograd.grad(u_x, x, torch.ones_like(u_x), create_graph=True)[0]
 
 
+def flat_params(net):
+    return torch.cat([p.detach().reshape(-1) for p in net.parameters()])
+
+
+def functional_parts(net, k, x_coll, x_b):
+    names = [nm for nm, _ in net.named_parameters()]
+    shapes = [p.shape for _, p in net.named_parameters()]
+    sizes = [p.numel() for _, p in net.named_parameters()]
+    xc = x_coll.detach().reshape(-1)
+    xb = x_b.detach().reshape(-1)
+
+    def unflat(t):
+        out, i = {}, 0
+        for nm, sh, sz in zip(names, shapes, sizes):
+            out[nm] = t[i:i + sz].reshape(sh)
+            i += sz
+        return out
+
+    def u_scalar(t, x):
+        return functional_call(net, unflat(t), (x.reshape(1, 1),)).reshape(())
+
+    u_xx = grad(grad(u_scalar, argnums=1), argnums=1)
+
+    def r_pde(t):
+        return vmap(lambda x: u_xx(t, x) + k**2 * u_scalar(t, x) + f_torch(x))(xc)
+
+    def u_b(t):
+        return vmap(lambda x: u_scalar(t, x))(xb)
+
+    return r_pde, u_b
+
+
+def ntk_mu(r_pde, u_b, theta):
+    j_pde = jacrev(r_pde)(theta)
+    j_bc = jacrev(u_b)(theta)
+    return ((j_pde**2).sum(1).mean() / (j_bc**2).sum(1).mean()).item()
+
+
+def train_lm(net, k, x_coll, x_b, mu, mu_auto, hard_bc, lm_iter, verbose):
+    r_pde, u_b = functional_parts(net, k, x_coll, x_b)
+    n_c = x_coll.shape[0]
+    auto = mu_auto and not hard_bc
+    theta = flat_params(net)
+    if auto:
+        mu = ntk_mu(r_pde, u_b, theta)
+
+    def residuals(t, m):
+        r = r_pde(t) / math.sqrt(n_c)
+        if hard_bc:
+            return r
+        return torch.cat([r, u_b(t) * math.sqrt(m / 2)])
+
+    rv = residuals(theta, mu)
+    loss = (rv**2).sum().item()
+    jac = jacrev(lambda t: residuals(t, mu))(theta)
+    lam = 1e-3 * (torch.trace(jac @ jac.T) / jac.shape[0]).item()
+    hist = [loss]
+    t0 = time.time()
+    it = 0
+    for it in range(1, lm_iter + 1):
+        if auto and it % MU_EVERY["lm"] == 0:
+            mu = ntk_mu(r_pde, u_b, theta)
+            rv = residuals(theta, mu)
+            loss = (rv**2).sum().item()
+        jac = jacrev(lambda t: residuals(t, mu))(theta)
+        gram = jac @ jac.T
+        eye = torch.eye(gram.shape[0], dtype=gram.dtype)
+        accepted = False
+        for _ in range(60):
+            y = torch.linalg.solve(gram + lam * eye, rv)
+            trial = theta - jac.T @ y
+            rv_trial = residuals(trial, mu)
+            loss_trial = (rv_trial**2).sum().item()
+            if loss_trial < loss:
+                theta, rv, loss = trial, rv_trial, loss_trial
+                lam = max(lam / 3, 1e-14)
+                accepted = True
+                break
+            lam *= 2
+        hist.append(loss)
+        if verbose and it % 500 == 0:
+            pde = (rv[:n_c]**2).sum().item()
+            bc = 0.0 if hard_bc else (rv[n_c:]**2).sum().item() / mu
+            print(f"LM iter {it:5d}   loss {loss:.3e}   (pde {pde:.3e}, bc {bc:.3e})"
+                  + ("" if hard_bc else f"   mu {mu:.3e}") + f"   {time.time() - t0:.0f}s")
+        if not accepted or loss < 1e-24:
+            break
+
+    torch.nn.utils.vector_to_parameters(theta, net.parameters())
+    return mu, hist, it
+
+
 def run(k, n_coll=N_COLLOCATION, sampler=SAMPLER, resample=RESAMPLE, mu=MU,
-        n_iter=N_ITER, lbfgs_iter=LBFGS_ITER, seed=SEED, hard_bc=HARD_BC, stretch=STRETCH,
-        verbose=True, plot=True):
+        n_iter=N_ITER, lbfgs_iter=LBFGS_ITER, seed=SEED, hard_bc=HARD_BC, stretch=STRETCH, mu_power=MU_POWER,
+        optimizer=OPTIMIZER, lm_iter=LM_ITER, verbose=True, plot=True):
+    mu_auto = mu == "auto"
+    mu = 0.0 if mu_auto else mu * k**mu_power
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -158,45 +264,59 @@ def run(k, n_coll=N_COLLOCATION, sampler=SAMPLER, resample=RESAMPLE, mu=MU,
         print("=" * 78)
         print(f"k = {k:.6f}   k/pi = {k / np.pi:g}   nearest resonance n* = {n_star}   "
               f"gap |n*^2 pi^2 - k^2| = {gap:.4f}")
-        print(f"{config_label(mu, hard_bc, stretch, ascii=True)}   sampler = {sampler}   "
-              f"n_coll = {n_coll}   n_iter = {n_iter}   lbfgs_iter = {lbfgs_iter}\n")
+        steps = (f"lm_iter = {lm_iter}" if optimizer == "lm"
+                 else f"n_iter = {n_iter}   lbfgs_iter = {lbfgs_iter}")
+        print(f"{config_label(mu, hard_bc, stretch, optimizer, mu_auto, ascii=True)}   "
+              f"sampler = {sampler}   n_coll = {n_coll}   {steps}\n")
 
-    opt = torch.optim.Adam(net.parameters(), lr=LR)
-    hist_adam = []
-    for it in range(n_iter + 1):
-        if resample:
-            x_coll = collocation(n_coll, sampler, seed + it)
+    hist_adam, hist_lbfgs, hist_lm = [], [], []
+    loss_adam = pde_adam = bc_adam = float("nan")
+    lm_iters = 0
 
-        loss_pde, loss_bc = loss_parts(x_coll)
-        loss = loss_pde + mu * loss_bc
-        hist_adam.append(loss.item())
+    if optimizer == "lm":
+        mu, hist_lm, lm_iters = train_lm(net, k, x_coll, x_b, mu, mu_auto, hard_bc, lm_iter, verbose)
+    else:
+        auto = mu_auto and not hard_bc
+        if auto:
+            mu = ntk_mu(*functional_parts(net, k, x_coll, x_b), flat_params(net))
+        opt = torch.optim.Adam(net.parameters(), lr=LR)
+        for it in range(n_iter + 1):
+            if resample:
+                x_coll = collocation(n_coll, sampler, seed + it)
+            if auto and it > 0 and it % MU_EVERY["adam"] == 0:
+                mu = ntk_mu(*functional_parts(net, k, x_coll, x_b), flat_params(net))
 
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
+            loss_pde, loss_bc = loss_parts(x_coll)
+            loss = loss_pde + mu * loss_bc
+            hist_adam.append(loss.item())
 
-        if verbose and it % 1000 == 0:
-            print(f"iter {it:5d}   loss {loss.item():.3e}   "
-                  f"(pde {loss_pde.item():.3e}, bc {loss_bc.item():.3e})")
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
 
-    pde_adam, bc_adam = (t.item() for t in loss_parts(x_coll))
-    loss_adam = pde_adam + mu * bc_adam
+            if verbose and it % 1000 == 0:
+                print(f"iter {it:5d}   loss {loss.item():.3e}   "
+                      f"(pde {loss_pde.item():.3e}, bc {loss_bc.item():.3e})"
+                      + (f"   mu {mu:.3e}" if auto else ""))
 
-    lbfgs = torch.optim.LBFGS(net.parameters(), max_iter=lbfgs_iter, history_size=50,
-                              tolerance_grad=1e-12, tolerance_change=1e-14,
-                              line_search_fn="strong_wolfe")
-    hist_lbfgs = []
+        pde_adam, bc_adam = (t.item() for t in loss_parts(x_coll))
+        loss_adam = pde_adam + mu * bc_adam
 
-    def closure():
-        lbfgs.zero_grad()
-        loss_pde, loss_bc = loss_parts(x_coll)
-        l = loss_pde + mu * loss_bc
-        l.backward()
-        hist_lbfgs.append(l.item())
-        return l
+        lbfgs = torch.optim.LBFGS(net.parameters(), max_iter=lbfgs_iter, history_size=50,
+                                  tolerance_grad=1e-12, tolerance_change=1e-14,
+                                  line_search_fn="strong_wolfe")
 
-    if lbfgs_iter > 0:
-        lbfgs.step(closure)
+        def closure():
+            lbfgs.zero_grad()
+            loss_pde, loss_bc = loss_parts(x_coll)
+            l = loss_pde + mu * loss_bc
+            l.backward()
+            hist_lbfgs.append(l.item())
+            return l
+
+        if lbfgs_iter > 0:
+            lbfgs.step(closure)
+
     pde_final, bc_final = (t.item() for t in loss_parts(x_coll))
     loss_final = pde_final + mu * bc_final
 
@@ -226,9 +346,15 @@ def run(k, n_coll=N_COLLOCATION, sampler=SAMPLER, resample=RESAMPLE, mu=MU,
     top = np.argsort(energy)[::-1][:3] + 1
 
     if verbose:
-        print(f"\nafter Adam     loss {loss_adam:.3e}   (pde {pde_adam:.3e}, bc {bc_adam:.3e})")
-        print(f"after L-BFGS   loss {loss_final:.3e}   (pde {pde_final:.3e}, bc {bc_final:.3e})"
-              f"   [{len(hist_lbfgs)} evaluations]")
+        if optimizer == "lm":
+            print(f"\nafter LM       loss {loss_final:.3e}   (pde {pde_final:.3e}, bc {bc_final:.3e})"
+                  f"   [{lm_iters} iterations]")
+        else:
+            print(f"\nafter Adam     loss {loss_adam:.3e}   (pde {pde_adam:.3e}, bc {bc_adam:.3e})")
+            print(f"after L-BFGS   loss {loss_final:.3e}   (pde {pde_final:.3e}, bc {bc_final:.3e})"
+                  f"   [{len(hist_lbfgs)} evaluations]")
+        if mu_auto and not hard_bc:
+            print(f"automatic mu = {mu:.3e}   (= {mu / k**4:.2f} k^4)")
         print(f"\nsize of u        L2 = {u_l2:.3e}   max = {u_max:.3e}   "
               f"|beta_{n_star}| = {beta_star:.3e}")
         print(f"error            L2 = {err_l2:.3e}   max = {err_max:.3e}   "
@@ -246,7 +372,7 @@ def run(k, n_coll=N_COLLOCATION, sampler=SAMPLER, resample=RESAMPLE, mu=MU,
         a.plot(xs, u_nn, color=BLUE, lw=2, ls="--", label="PINN")
         a.set_xlabel("x")
         a.set_ylabel("u(x)")
-        a.set_title(f"k = {k / np.pi:g}π   ({config_label(mu, hard_bc, stretch)})")
+        a.set_title(f"k = {k / np.pi:g}π   ({config_label(mu, hard_bc, stretch, optimizer, mu_auto)})")
         a.legend(loc="best")
 
         a = ax[0, 1]
@@ -273,14 +399,20 @@ def run(k, n_coll=N_COLLOCATION, sampler=SAMPLER, resample=RESAMPLE, mu=MU,
         a.legend(loc="upper right")
 
         a = ax[1, 1]
-        a.semilogy(np.arange(len(hist_adam)), hist_adam, color=BLUE, lw=0.8,
-                   label="Adam (per iteration)")
-        if hist_lbfgs:
-            a.semilogy(len(hist_adam) + np.arange(len(hist_lbfgs)), hist_lbfgs,
-                       color=ORANGE, lw=1.2, label="L-BFGS (per evaluation)")
-        a.set_xlabel("step")
+        if optimizer == "lm":
+            a.semilogy(np.arange(len(hist_lm)), hist_lm, color=BLUE, lw=1.2,
+                       label="Levenberg–Marquardt (per iteration)")
+            a.set_xlabel("LM iteration")
+            a.set_title(f"loss:  after LM {loss_final:.2e}  ({lm_iters} iterations)")
+        else:
+            a.semilogy(np.arange(len(hist_adam)), hist_adam, color=BLUE, lw=0.8,
+                       label="Adam (per iteration)")
+            if hist_lbfgs:
+                a.semilogy(len(hist_adam) + np.arange(len(hist_lbfgs)), hist_lbfgs,
+                           color=ORANGE, lw=1.2, label="L-BFGS (per evaluation)")
+            a.set_xlabel("step")
+            a.set_title(f"loss:  after Adam {loss_adam:.2e},  after L-BFGS {loss_final:.2e}")
         a.set_ylabel("loss")
-        a.set_title(f"loss:  after Adam {loss_adam:.2e},  after L-BFGS {loss_final:.2e}")
         a.legend(loc="upper right")
 
         for a in ax.ravel():
@@ -288,30 +420,35 @@ def run(k, n_coll=N_COLLOCATION, sampler=SAMPLER, resample=RESAMPLE, mu=MU,
             a.set_axisbelow(True)
 
         plt.tight_layout()
-        path = f"figures/pinn_kpi{k / np.pi:g}_{config_tag(mu, hard_bc, stretch)}.png"
+        tag = config_tag(mu, hard_bc, stretch, optimizer, mu_auto)
+        path = f"figures/pinn_kpi{k / np.pi:g}_{tag}.png"
         plt.savefig(path, dpi=140)
         plt.close(fig)
         if verbose:
             print(f"saved {path}")
 
-    return dict(kpi=k / np.pi, k=k, n_star=n_star, gap=gap, mu=mu, hard_bc=hard_bc,
-                stretch=stretch, n_coll=n_coll, u_l2=u_l2, u_max=u_max, beta_star=beta_star,
-                err_l2=err_l2, err_max=err_max, rel_err=rel_err, share_star=share_star,
-                loss_adam=loss_adam, pde_adam=pde_adam, bc_adam=bc_adam,
+    return dict(kpi=k / np.pi, k=k, n_star=n_star, gap=gap, mu=mu, mu_auto=mu_auto, hard_bc=hard_bc,
+                stretch=stretch, optimizer=optimizer, n_coll=n_coll, u_l2=u_l2, u_max=u_max,
+                beta_star=beta_star, err_l2=err_l2, err_max=err_max, rel_err=rel_err,
+                share_star=share_star, loss_adam=loss_adam, pde_adam=pde_adam, bc_adam=bc_adam,
                 loss_final=loss_final, pde_final=pde_final, bc_final=bc_final,
-                max_res=res_dense, lbfgs_evals=len(hist_lbfgs), spec_shape=spec_shape)
+                max_res=res_dense, lbfgs_evals=len(hist_lbfgs), lm_iters=lm_iters,
+                spec_shape=spec_shape)
 
 
-CSV_KEYS = ["kpi", "k", "n_star", "gap", "mu", "hard_bc", "stretch", "n_coll", "u_l2",
-            "u_max", "beta_star", "err_l2", "err_max", "rel_err", "share_star", "loss_adam",
-            "pde_adam", "bc_adam", "loss_final", "pde_final", "bc_final", "max_res",
-            "lbfgs_evals"]
+CSV_KEYS = ["kpi", "k", "n_star", "gap", "mu", "mu_auto", "hard_bc", "stretch", "optimizer",
+            "n_coll", "u_l2", "u_max", "beta_star", "err_l2", "err_max", "rel_err", "share_star",
+            "loss_adam", "pde_adam", "bc_adam", "loss_final", "pde_final", "bc_final", "max_res",
+            "lbfgs_evals", "lm_iters"]
 
 
 def summarize(rows):
     mu, hard_bc, stretch = rows[0]["mu"], rows[0]["hard_bc"], rows[0]["stretch"]
+    optimizer, mu_auto = rows[0]["optimizer"], rows[0]["mu_auto"]
+    lm = optimizer == "lm"
     kpis = [r["kpi"] for r in rows]
-    stem = f"resonance_kpi{min(kpis):g}-{max(kpis):g}_{config_tag(mu, hard_bc, stretch)}"
+    tag = config_tag(mu, hard_bc, stretch, optimizer, mu_auto)
+    stem = f"resonance_kpi{min(kpis):g}-{max(kpis):g}_{tag}"
 
     os.makedirs("results", exist_ok=True)
     with open(f"results/{stem}.csv", "w", newline="") as fh:
@@ -322,14 +459,17 @@ def summarize(rows):
 
     ns = rows[0]["n_star"]
     print("\n" + "=" * 78)
-    print(f"SUMMARY   {config_label(mu, hard_bc, stretch, ascii=True)}")
-    print(f"{'k/pi':>9} {'gap':>8} {'||u||':>10} {'|beta_' + str(ns) + '|':>10} "
+    print(f"SUMMARY   {config_label(mu, hard_bc, stretch, optimizer, mu_auto, ascii=True)}")
+    print(f"{'k/pi':>9} {'gap':>8} {'mu':>10} {'||u||':>10} {'|beta_' + str(ns) + '|':>10} "
           f"{'||err||':>10} {'rel_err':>10} {'share_' + str(ns):>9} "
-          f"{'loss_Adam':>10} {'loss_LBFGS':>10}")
+          + (f"{'loss_LM':>10}" if lm else f"{'loss_Adam':>10} {'loss_LBFGS':>10}"))
     for r in rows:
-        print(f"{r['kpi']:>9g} {r['gap']:>8.2f} {r['u_l2']:>10.3e} {r['beta_star']:>10.3e} "
-              f"{r['err_l2']:>10.3e} {r['rel_err']:>10.3e} {r['share_star']:>9.1%} "
-              f"{r['loss_adam']:>10.3e} {r['loss_final']:>10.3e}")
+        mu_txt = "-" if hard_bc else f"{r['mu']:.3e}"
+        print(f"{r['kpi']:>9g} {r['gap']:>8.2f} {mu_txt:>10} {r['u_l2']:>10.3e} "
+              f"{r['beta_star']:>10.3e} {r['err_l2']:>10.3e} {r['rel_err']:>10.3e} "
+              f"{r['share_star']:>9.1%} "
+              + (f"{r['loss_final']:>10.3e}" if lm
+                 else f"{r['loss_adam']:>10.3e} {r['loss_final']:>10.3e}"))
     print(f"\nsaved results/{stem}.csv")
 
     if len(rows) < 2:
@@ -390,8 +530,11 @@ def summarize(rows):
     a.set_title(f"3b.  Share of the error in mode {ns}")
 
     a = ax[1, 2]
-    a.loglog(d, col("loss_adam"), "o-", color=BLUE, lw=2, ms=7, label="after Adam")
-    a.loglog(d, col("loss_final"), "o-", color=ORANGE, lw=2, ms=7, label="after L-BFGS")
+    if lm:
+        a.loglog(d, col("loss_final"), "o-", color=BLUE, lw=2, ms=7, label="after LM")
+    else:
+        a.loglog(d, col("loss_adam"), "o-", color=BLUE, lw=2, ms=7, label="after Adam")
+        a.loglog(d, col("loss_final"), "o-", color=ORANGE, lw=2, ms=7, label="after L-BFGS")
     a.set_title("4.  Does the loss get larger?")
     a.set_ylabel("loss  (pde)" if hard_bc else "loss  (pde + μ · bc)")
 
@@ -414,7 +557,8 @@ def summarize(rows):
         a.set_xlabel(f"k / π     (log scale, closer to {ns} →)")
 
     fig.suptitle(f"Approaching resonance k → {ns}π     "
-                 f"({config_label(mu, hard_bc, stretch)},  n_coll = {rows[0]['n_coll']})",
+                 f"({config_label(mu, hard_bc, stretch, optimizer, mu_auto)},  "
+                 f"n_coll = {rows[0]['n_coll']})",
                  fontsize=13)
     plt.tight_layout()
     os.makedirs("figures", exist_ok=True)
@@ -424,20 +568,28 @@ def summarize(rows):
     print(f"saved {path}")
 
 
+def mu_arg(s):
+    return s if s == "auto" else float(s)
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--kpi", type=float, nargs="+", default=KPI_SWEEP)
     p.add_argument("--n-coll", type=int, default=N_COLLOCATION)
     p.add_argument("--sampler", default=SAMPLER)
     p.add_argument("--resample", action="store_true", default=RESAMPLE)
-    p.add_argument("--mu", type=float, default=MU)
+    p.add_argument("--optimizer", choices=["lm", "adam"], default=OPTIMIZER)
+    p.add_argument("--mu", type=mu_arg, default=MU)
+    p.add_argument("--mu-power", type=float, default=MU_POWER)
     p.add_argument("--hard-bc", action="store_true", default=HARD_BC)
     p.add_argument("--stretch", action="store_true", default=STRETCH)
+    p.add_argument("--lm-iter", type=int, default=LM_ITER)
     p.add_argument("--n-iter", type=int, default=N_ITER)
     p.add_argument("--lbfgs-iter", type=int, default=LBFGS_ITER)
     p.add_argument("--seed", type=int, default=SEED)
     a = p.parse_args()
     rows = [run(kpi * np.pi, a.n_coll, a.sampler, a.resample, a.mu, a.n_iter,
-                a.lbfgs_iter, a.seed, hard_bc=a.hard_bc, stretch=a.stretch)
+                a.lbfgs_iter, a.seed, hard_bc=a.hard_bc, stretch=a.stretch, mu_power=a.mu_power,
+                optimizer=a.optimizer, lm_iter=a.lm_iter)
             for kpi in a.kpi]
     summarize(rows)
