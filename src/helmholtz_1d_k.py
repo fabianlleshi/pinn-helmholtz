@@ -3,7 +3,6 @@ import csv
 import math
 import os
 import time
-import warnings
 
 import numpy as np
 import torch
@@ -11,7 +10,6 @@ import torch.nn as nn
 from torch.func import functional_call, grad, jacrev, vmap
 from scipy.fft import dst
 from scipy.integrate import quad
-from scipy.stats import qmc
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -20,16 +18,18 @@ from matplotlib.ticker import FuncFormatter, LogLocator, MaxNLocator, NullLocato
 torch.set_default_dtype(torch.float64)
 
 
-KPI_SWEEP = [6.5, 6.25, 6.125, 6.0625, 6.03125]
-SAMPLER = "grid"
-N_COLLOCATION = 100
-RESAMPLE = False
+K_MIN = 4.0
+K_MAX = 6.0
+K_TEST = None
+N_COLLOCATION = 1000
+N_BOUNDARY = 50
+FOCUS = 0.0
+FOCUS_WIDTH = 0.1
+SCALE_K = True
 OPTIMIZER = "lm"
 MU = "auto"
-MU_POWER = 4.0
 MU_EVERY = {"lm": 10, "adam": 100}
 HARD_BC = False
-STRETCH = False
 LM_ITER = 3000
 N_ITER = 20000
 LBFGS_ITER = 5000
@@ -37,6 +37,7 @@ LR = 1e-3
 WIDTH = 32
 DEPTH = 3
 N_MODES = 1000
+N_K_CURVE = 100
 SEED = 5
 
 INK = "#0b0b0b"
@@ -45,7 +46,6 @@ GRID = "#e4e3df"
 BLUE = "#2a78d6"
 ORANGE = "#eb6834"
 VIOLET = "#4a3aa7"
-RAMP = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281"]
 
 plt.rcParams.update({
     "axes.edgecolor": MUTED, "axes.labelcolor": INK, "xtick.color": MUTED,
@@ -77,87 +77,113 @@ def u_exact(x, k):
     return (exact_coefficients(k)[None, :] * np.sin(np.outer(x, n * np.pi))).sum(axis=1)
 
 
+def u_exact_many(x, ks):
+    coeffs = np.stack([exact_coefficients(k) for k in ks], axis=1)
+    return np.sin(np.outer(x, n * np.pi)) @ coeffs
+
+
 def nearest_resonance(k):
     gaps = np.abs(n**2 * np.pi**2 - k**2)
     i = gaps.argmin()
     return int(n[i]), gaps[i]
 
 
+def resonances_in(k_min, k_max):
+    return [int(m) for m in n if k_min - 1e-9 <= m * np.pi <= k_max + 1e-9]
+
+
 def sine_coefficients(values):
     return dst(values[1:-1], type=1) / (len(values) - 1)
 
 
-def l2(values):
-    return np.sqrt(np.mean(values**2))
+def l2(values, axis=None):
+    return np.sqrt(np.mean(values**2, axis=axis))
 
 
-def config_tag(mu, hard_bc, stretch, optimizer="adam", mu_auto=False):
+def config_tag(mu, hard_bc, scale_k, optimizer, mu_auto):
     bc = "hard" if hard_bc else ("muauto" if mu_auto else f"mu{mu:g}")
-    return f"{bc}_{'stretch' if stretch else 'plain'}_{optimizer}"
+    return f"{bc}_{'kscaled' if scale_k else 'kraw'}_{optimizer}"
 
 
-def config_label(mu, hard_bc, stretch, optimizer="adam", mu_auto=False, ascii=False):
+def config_label(mu, hard_bc, scale_k, optimizer, mu_auto, ascii=False):
     m = "mu" if ascii else "μ"
     if hard_bc:
         bc = "hard BC"
     else:
         bc = f"weak BC {m} = " + ("auto" if mu_auto else f"{mu:g}")
+    kin = "k scaled to [-1, 1]" if scale_k else "raw k"
     opt = "LM" if optimizer == "lm" else "Adam + L-BFGS"
-    return f"{bc}, {'input stretch' if stretch else 'no scaling'}, {opt}"
+    return f"{bc}, {kin}, {opt}"
 
 
-def collocation(n_pts, sampler, seed):
-    if sampler == "grid":
-        pts = np.linspace(0.0, 1.0, n_pts + 2)[1:-1]
-    elif sampler == "random":
-        pts = np.random.rand(n_pts)
-    elif sampler == "sobol":
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            pts = qmc.Sobol(d=1, scramble=True, seed=seed).random(n_pts).ravel()
-    elif sampler == "halton":
-        pts = qmc.Halton(d=1, scramble=True, seed=seed).random(n_pts).ravel()
-    else:
-        raise ValueError(sampler)
-    t = torch.tensor(pts, dtype=torch.get_default_dtype()).reshape(-1, 1)
-    return t.requires_grad_(True)
+def near_resonance_k(n_pts, k_min, k_max, width):
+    windows = [(max(k_min, m * np.pi - width), min(k_max, m * np.pi + width))
+               for m in resonances_in(k_min - width, k_max + width)]
+    windows = [(a, b) for a, b in windows if b > a]
+    if not windows:
+        return k_min + (k_max - k_min) * np.random.rand(n_pts)
+    starts = np.array([a for a, _ in windows])
+    edges = np.r_[0.0, np.cumsum([b - a for a, b in windows])]
+    s = edges[-1] * np.random.rand(n_pts)
+    i = np.clip(np.searchsorted(edges, s, side="right") - 1, 0, len(windows) - 1)
+    return starts[i] + s - edges[i]
+
+
+def sample_points(n_coll, n_bc, k_min, k_max, focus=FOCUS, focus_width=FOCUS_WIDTH * np.pi):
+    n_focus = int(round(focus * n_coll))
+    x = np.random.rand(n_coll)
+    k = k_min + (k_max - k_min) * np.random.rand(n_coll - n_focus)
+    if n_focus > 0:
+        k = np.r_[k, near_resonance_k(n_focus, k_min, k_max, focus_width)]
+    kb = k_min + (k_max - k_min) * np.random.rand(n_bc)
+    X = torch.tensor(np.stack([x, k], axis=1))
+    Xb = torch.tensor(np.stack([np.r_[np.zeros(n_bc), np.ones(n_bc)], np.r_[kb, kb]], axis=1))
+    return X, Xb
+
+
+def pairs(x, k):
+    return torch.tensor(np.stack([x, np.full_like(x, k)], axis=1))
 
 
 class PINN(nn.Module):
-    def __init__(self, k, hard_bc=HARD_BC, stretch=STRETCH, width=WIDTH, depth=DEPTH):
+    def __init__(self, k_min, k_max, hard_bc=HARD_BC, scale_k=SCALE_K, width=WIDTH, depth=DEPTH):
         super().__init__()
-        layers = [nn.Linear(1, width), nn.Tanh()]
+        layers = [nn.Linear(2, width), nn.Tanh()]
         for _ in range(depth - 1):
             layers += [nn.Linear(width, width), nn.Tanh()]
         layers += [nn.Linear(width, 1)]
         self.net = nn.Sequential(*layers)
         self.hard_bc = hard_bc
-        self.stretch = stretch
-        self.s_in = max(1.0, k / (2 * np.pi))
+        self.scale_k = scale_k
+        self.k_mid = 0.5 * (k_min + k_max)
+        self.k_half = max(0.5 * (k_max - k_min), 1e-12)
 
-    def forward(self, x):
-        z = self.s_in * (2.0 * x - 1.0) if self.stretch else x
-        u = self.net(z)
+    def forward(self, X):
+        x, k = X[:, 0:1], X[:, 1:2]
+        k_in = (k - self.k_mid) / self.k_half if self.scale_k else k
+        u = self.net(torch.cat([x, k_in], dim=1))
         if self.hard_bc:
             return x * (1.0 - x) * u
         return u
 
 
-def second_derivative(u, x):
-    u_x = torch.autograd.grad(u, x, torch.ones_like(u), create_graph=True)[0]
-    return torch.autograd.grad(u_x, x, torch.ones_like(u_x), create_graph=True)[0]
+def residual(net, X):
+    X = X.detach().requires_grad_(True)
+    u = net(X)
+    u_x = torch.autograd.grad(u, X, torch.ones_like(u), create_graph=True)[0][:, 0:1]
+    u_xx = torch.autograd.grad(u_x, X, torch.ones_like(u_x), create_graph=True)[0][:, 0:1]
+    x, k = X[:, 0:1], X[:, 1:2]
+    return u_xx + k**2 * u + f_torch(x)
 
 
 def flat_params(net):
     return torch.cat([p.detach().reshape(-1) for p in net.parameters()])
 
 
-def functional_parts(net, k, x_coll, x_b):
+def functional_parts(net, X, Xb):
     names = [nm for nm, _ in net.named_parameters()]
     shapes = [p.shape for _, p in net.named_parameters()]
     sizes = [p.numel() for _, p in net.named_parameters()]
-    xc = x_coll.detach().reshape(-1)
-    xb = x_b.detach().reshape(-1)
 
     def unflat(t):
         out, i = {}, 0
@@ -166,59 +192,66 @@ def functional_parts(net, k, x_coll, x_b):
             i += sz
         return out
 
-    def u_scalar(t, x):
-        return functional_call(net, unflat(t), (x.reshape(1, 1),)).reshape(())
+    def u_point(t, p):
+        return functional_call(net, unflat(t), (p.reshape(1, 2),)).reshape(())
 
-    u_xx = grad(grad(u_scalar, argnums=1), argnums=1)
+    def u_x(t, p):
+        return grad(u_point, argnums=1)(t, p)[0]
 
-    def r_pde(t):
-        return vmap(lambda x: u_xx(t, x) + k**2 * u_scalar(t, x) + f_torch(x))(xc)
+    def r_point(t, p):
+        return grad(u_x, argnums=1)(t, p)[0] + p[1]**2 * u_point(t, p) + f_torch(p[0])
 
-    def u_b(t):
-        return vmap(lambda x: u_scalar(t, x))(xb)
+    X, Xb = X.detach(), Xb.detach()
+    r_all = vmap(r_point, in_dims=(None, 0))
+    u_all = vmap(u_point, in_dims=(None, 0))
+    jr_all = vmap(jacrev(r_point), in_dims=(None, 0))
+    ju_all = vmap(jacrev(u_point), in_dims=(None, 0))
+    return (lambda t: r_all(t, X), lambda t: u_all(t, Xb),
+            lambda t: jr_all(t, X), lambda t: ju_all(t, Xb))
 
-    return r_pde, u_b
 
-
-def ntk_mu(r_pde, u_b, theta):
-    j_pde = jacrev(r_pde)(theta)
-    j_bc = jacrev(u_b)(theta)
+def ntk_mu(j_pde, j_bc):
     return ((j_pde**2).sum(1).mean() / (j_bc**2).sum(1).mean()).item()
 
 
-def train_lm(net, k, x_coll, x_b, mu, mu_auto, hard_bc, lm_iter, verbose):
-    r_pde, u_b = functional_parts(net, k, x_coll, x_b)
-    n_c = x_coll.shape[0]
+def train_lm(net, X, Xb, mu, mu_auto, hard_bc, lm_iter, verbose):
+    r_fn, b_fn, jr_fn, jb_fn = functional_parts(net, X, Xb)
+    n_c, n_b = X.shape[0], Xb.shape[0]
     auto = mu_auto and not hard_bc
     theta = flat_params(net)
-    if auto:
-        mu = ntk_mu(r_pde, u_b, theta)
 
     def residuals(t, m):
-        r = r_pde(t) / math.sqrt(n_c)
+        r = r_fn(t) / math.sqrt(n_c)
         if hard_bc:
             return r
-        return torch.cat([r, u_b(t) * math.sqrt(m / 2)])
+        return torch.cat([r, b_fn(t) * math.sqrt(m / n_b)])
 
-    rv = residuals(theta, mu)
-    loss = (rv**2).sum().item()
-    jac = jacrev(lambda t: residuals(t, mu))(theta)
-    lam = 1e-3 * (torch.trace(jac @ jac.T) / jac.shape[0]).item()
-    hist = [loss]
+    rv, loss, lam = None, None, None
     t0 = time.time()
     it = 0
     for it in range(1, lm_iter + 1):
-        if auto and it % MU_EVERY["lm"] == 0:
-            mu = ntk_mu(r_pde, u_b, theta)
+        j_pde = jr_fn(theta)
+        j_bc = None if hard_bc else jb_fn(theta)
+        if auto and (it == 1 or it % MU_EVERY["lm"] == 0):
+            mu = ntk_mu(j_pde, j_bc)
+            rv = None
+        if rv is None:
             rv = residuals(theta, mu)
             loss = (rv**2).sum().item()
-        jac = jacrev(lambda t: residuals(t, mu))(theta)
-        gram = jac @ jac.T
+        if hard_bc:
+            jac = j_pde / math.sqrt(n_c)
+        else:
+            jac = torch.cat([j_pde / math.sqrt(n_c), j_bc * math.sqrt(mu / n_b)])
+        dual = jac.shape[0] <= jac.shape[1]
+        gram = jac @ jac.T if dual else jac.T @ jac
+        rhs = rv if dual else jac.T @ rv
         eye = torch.eye(gram.shape[0], dtype=gram.dtype)
+        if lam is None:
+            lam = 1e-3 * (jac**2).sum().item() / jac.shape[0]
         accepted = False
         for _ in range(60):
-            y = torch.linalg.solve(gram + lam * eye, rv)
-            trial = theta - jac.T @ y
+            step = torch.linalg.solve(gram + lam * eye, rhs)
+            trial = theta - (jac.T @ step if dual else step)
             rv_trial = residuals(trial, mu)
             loss_trial = (rv_trial**2).sum().item()
             if loss_trial < loss:
@@ -227,7 +260,6 @@ def train_lm(net, k, x_coll, x_b, mu, mu_auto, hard_bc, lm_iter, verbose):
                 accepted = True
                 break
             lam *= 2
-        hist.append(loss)
         if verbose and it % 500 == 0:
             pde = (rv[:n_c]**2).sum().item()
             bc = 0.0 if hard_bc else (rv[n_c:]**2).sum().item() / mu
@@ -237,58 +269,58 @@ def train_lm(net, k, x_coll, x_b, mu, mu_auto, hard_bc, lm_iter, verbose):
             break
 
     torch.nn.utils.vector_to_parameters(theta, net.parameters())
-    return mu, hist, it
+    return mu, it
 
 
-def run(k, n_coll=N_COLLOCATION, sampler=SAMPLER, resample=RESAMPLE, mu=MU,
-        n_iter=N_ITER, lbfgs_iter=LBFGS_ITER, seed=SEED, hard_bc=HARD_BC, stretch=STRETCH, mu_power=MU_POWER,
-        optimizer=OPTIMIZER, lm_iter=LM_ITER, verbose=True, plot=True):
+def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOCATION,
+        n_bc=N_BOUNDARY, focus=FOCUS, focus_width=FOCUS_WIDTH * np.pi, mu=MU, scale_k=SCALE_K,
+        hard_bc=HARD_BC, optimizer=OPTIMIZER, lm_iter=LM_ITER, n_iter=N_ITER,
+        lbfgs_iter=LBFGS_ITER, width=WIDTH, depth=DEPTH, seed=SEED, verbose=True, plot=True):
     mu_auto = mu == "auto"
-    mu = 0.0 if mu_auto else mu * k**mu_power
+    mu = 0.0 if mu_auto else float(mu)
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    net = PINN(k, hard_bc=hard_bc, stretch=stretch)
-    x_b = torch.tensor([[0.0], [1.0]])
-    x_coll = collocation(n_coll, sampler, seed)
-    n_star, gap = nearest_resonance(k)
-
-    def residual(x):
-        u = net(x)
-        return second_derivative(u, x) + k**2 * u + f_torch(x)
-
-    def loss_parts(x):
-        return (residual(x)**2).mean(), (net(x_b)**2).mean()
+    net = PINN(k_min, k_max, hard_bc=hard_bc, scale_k=scale_k, width=width, depth=depth)
+    X, Xb = sample_points(n_coll, n_bc, k_min, k_max, focus, focus_width)
+    test_kind = "random" if k_test is None else "chosen"
+    if k_test is None:
+        k_test = np.random.default_rng().uniform(k_min, k_max)
+    res_in = resonances_in(k_min, k_max)
+    points = f"n_coll = {n_coll}" + (f" ({focus:.0%} within {focus_width / np.pi:g}pi of a resonance)"
+                                      if focus > 0 else "")
 
     if verbose:
         print("=" * 78)
-        print(f"k = {k:.6f}   k/pi = {k / np.pi:g}   nearest resonance n* = {n_star}   "
-              f"gap |n*^2 pi^2 - k^2| = {gap:.4f}")
+        print(f"training range   {k_min / np.pi:g}pi <= k <= {k_max / np.pi:g}pi   resonances in range: "
+              + (", ".join(f"{m}pi" for m in res_in) if res_in else "none"))
         steps = (f"lm_iter = {lm_iter}" if optimizer == "lm"
                  else f"n_iter = {n_iter}   lbfgs_iter = {lbfgs_iter}")
-        print(f"{config_label(mu, hard_bc, stretch, optimizer, mu_auto, ascii=True)}   "
-              f"sampler = {sampler}   n_coll = {n_coll}   {steps}\n")
+        print(f"{config_label(mu, hard_bc, scale_k, optimizer, mu_auto, ascii=True)}   "
+              f"{points}   n_bc = {n_bc}   width = {width}   depth = {depth}   {steps}\n")
 
-    hist_adam, hist_lbfgs, hist_lm = [], [], []
-    loss_adam = pde_adam = bc_adam = float("nan")
+    hist_lbfgs = []
     lm_iters = 0
 
+    def loss_parts():
+        return (residual(net, X)**2).mean(), (net(Xb)**2).mean()
+
     if optimizer == "lm":
-        mu, hist_lm, lm_iters = train_lm(net, k, x_coll, x_b, mu, mu_auto, hard_bc, lm_iter, verbose)
+        mu, lm_iters = train_lm(net, X, Xb, mu, mu_auto, hard_bc, lm_iter, verbose)
     else:
         auto = mu_auto and not hard_bc
+        jr_fn, jb_fn = functional_parts(net, X, Xb)[2:]
         if auto:
-            mu = ntk_mu(*functional_parts(net, k, x_coll, x_b), flat_params(net))
+            theta = flat_params(net)
+            mu = ntk_mu(jr_fn(theta), jb_fn(theta))
         opt = torch.optim.Adam(net.parameters(), lr=LR)
         for it in range(n_iter + 1):
-            if resample:
-                x_coll = collocation(n_coll, sampler, seed + it)
             if auto and it > 0 and it % MU_EVERY["adam"] == 0:
-                mu = ntk_mu(*functional_parts(net, k, x_coll, x_b), flat_params(net))
+                theta = flat_params(net)
+                mu = ntk_mu(jr_fn(theta), jb_fn(theta))
 
-            loss_pde, loss_bc = loss_parts(x_coll)
+            loss_pde, loss_bc = loss_parts()
             loss = loss_pde + mu * loss_bc
-            hist_adam.append(loss.item())
 
             opt.zero_grad()
             loss.backward()
@@ -299,16 +331,13 @@ def run(k, n_coll=N_COLLOCATION, sampler=SAMPLER, resample=RESAMPLE, mu=MU,
                       f"(pde {loss_pde.item():.3e}, bc {loss_bc.item():.3e})"
                       + (f"   mu {mu:.3e}" if auto else ""))
 
-        pde_adam, bc_adam = (t.item() for t in loss_parts(x_coll))
-        loss_adam = pde_adam + mu * bc_adam
-
         lbfgs = torch.optim.LBFGS(net.parameters(), max_iter=lbfgs_iter, history_size=50,
                                   tolerance_grad=1e-12, tolerance_change=1e-14,
                                   line_search_fn="strong_wolfe")
 
         def closure():
             lbfgs.zero_grad()
-            loss_pde, loss_bc = loss_parts(x_coll)
+            loss_pde, loss_bc = loss_parts()
             l = loss_pde + mu * loss_bc
             l.backward()
             hist_lbfgs.append(l.item())
@@ -317,20 +346,20 @@ def run(k, n_coll=N_COLLOCATION, sampler=SAMPLER, resample=RESAMPLE, mu=MU,
         if lbfgs_iter > 0:
             lbfgs.step(closure)
 
-    pde_final, bc_final = (t.item() for t in loss_parts(x_coll))
+    pde_final, bc_final = (t.item() for t in loss_parts())
     loss_final = pde_final + mu * bc_final
 
     xs = np.linspace(0.0, 1.0, 2001)
-    u_ex = u_exact(xs, k)
-    xt = torch.tensor(xs, dtype=torch.get_default_dtype()).reshape(-1, 1).requires_grad_(True)
-    res_dense = residual(xt).abs().max().item()
+    n_star, gap = nearest_resonance(k_test)
+    u_ex = u_exact(xs, k_test)
+    X_test = pairs(xs, k_test)
+    res_test = residual(net, X_test).abs().max().item()
     with torch.no_grad():
-        u_nn = net(xt).numpy().ravel()
+        u_nn = net(X_test).numpy().ravel()
 
     err = u_ex - u_nn
     u_l2 = l2(u_ex)
     u_max = np.abs(u_ex).max()
-    beta_star = abs(exact_coefficients(k)[n_star - 1])
     err_l2 = l2(err)
     err_max = np.abs(err).max()
     rel_err = err_l2 / u_l2
@@ -340,39 +369,67 @@ def run(k, n_coll=N_COLLOCATION, sampler=SAMPLER, resample=RESAMPLE, mu=MU,
     ref = np.linalg.norm(ex_hat)
     rel_spec = np.abs(err_hat) / ref
     ex_spec = np.abs(ex_hat) / ref
-    spec_shape = np.abs(err_hat) / np.linalg.norm(err_hat)
     energy = err_hat**2 / (err_hat**2).sum()
     share_star = energy[n_star - 1]
     top = np.argsort(energy)[::-1][:3] + 1
+
+    k_curve = k_min + (np.arange(N_K_CURVE) + 0.5) * (k_max - k_min) / N_K_CURVE
+    U_ex = u_exact_many(xs, k_curve)
+    Xg = torch.tensor(np.stack([np.tile(xs, N_K_CURVE), np.repeat(k_curve, len(xs))], axis=1))
+    with torch.no_grad():
+        U_nn = net(Xg).numpy().reshape(N_K_CURVE, len(xs)).T
+    curve_u = l2(U_ex, axis=0)
+    curve_err = l2(U_ex - U_nn, axis=0)
+    curve_rel = curve_err / curve_u
+    worst = curve_rel.argmax()
 
     if verbose:
         if optimizer == "lm":
             print(f"\nafter LM       loss {loss_final:.3e}   (pde {pde_final:.3e}, bc {bc_final:.3e})"
                   f"   [{lm_iters} iterations]")
         else:
-            print(f"\nafter Adam     loss {loss_adam:.3e}   (pde {pde_adam:.3e}, bc {bc_adam:.3e})")
-            print(f"after L-BFGS   loss {loss_final:.3e}   (pde {pde_final:.3e}, bc {bc_final:.3e})"
+            print(f"\nafter L-BFGS   loss {loss_final:.3e}   (pde {pde_final:.3e}, bc {bc_final:.3e})"
                   f"   [{len(hist_lbfgs)} evaluations]")
         if mu_auto and not hard_bc:
-            print(f"automatic mu = {mu:.3e}   (= {mu / k**4:.2f} k^4)")
-        print(f"\nsize of u        L2 = {u_l2:.3e}   max = {u_max:.3e}   "
-              f"|beta_{n_star}| = {beta_star:.3e}")
+            k_mid = 0.5 * (k_min + k_max)
+            print(f"automatic mu = {mu:.3e}   (= {mu / k_mid**4:.2f} k_mid^4)")
+        print(f"\nTEST at k = {k_test / np.pi:.4f}pi   ({test_kind}, not a training point)   "
+              f"nearest resonance n* = {n_star}   gap |n*^2 pi^2 - k^2| = {gap:.4f}")
+        print(f"size of u        L2 = {u_l2:.3e}   max = {u_max:.3e}")
         print(f"error            L2 = {err_l2:.3e}   max = {err_max:.3e}   "
               f"relative = {rel_err:.3e}")
         print(f"error spectrum   share in mode {n_star} = {share_star:.1%}   largest: "
               + "   ".join(f"n={m} ({energy[m - 1]:.1%})" for m in top))
-        print(f"max |residual| on dense grid = {res_dense:.3e}")
+        print(f"max |residual| at test k = {res_test:.3e}")
+        print(f"\nacross the range ({N_K_CURVE} k values)   relative error: median "
+              f"{np.median(curve_rel):.3e}   worst {curve_rel[worst]:.3e} "
+              f"at k = {k_curve[worst] / np.pi:.4f}pi")
+
+    tag = config_tag(mu, hard_bc, scale_k, optimizer, mu_auto)
+    stem = (f"param_k{k_min / np.pi:g}-{k_max / np.pi:g}_{tag}"
+            + (f"_n{n_coll}" if n_coll != N_COLLOCATION else "")
+            + (f"_focus{focus:g}" if focus > 0 else ""))
+    os.makedirs("results", exist_ok=True)
+    with open(f"results/{stem}.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["kpi", "k", "n_star", "gap", "u_l2", "err_l2", "rel_err", "test"])
+        for kc, ul, el, rl in zip(k_curve, curve_u, curve_err, curve_rel):
+            ns, gp = nearest_resonance(kc)
+            w.writerow([kc / np.pi, kc, ns, gp, ul, el, rl, 0])
+        w.writerow([k_test / np.pi, k_test, n_star, gap, u_l2, err_l2, rel_err, 1])
+    if verbose:
+        print(f"\nsaved results/{stem}.csv")
 
     if plot:
         os.makedirs("figures", exist_ok=True)
         fig, ax = plt.subplots(2, 2, figsize=(12, 8))
 
         a = ax[0, 0]
-        a.plot(xs, u_ex, color=INK, lw=2, label="exact (Fourier)")
-        a.plot(xs, u_nn, color=BLUE, lw=2, ls="--", label="PINN")
+        a.plot(xs, u_ex, color=INK, lw=2, label="real (exact Fourier)")
+        a.plot(xs, u_nn, color=BLUE, lw=2, ls="--", label="tested (PINN)")
         a.set_xlabel("x")
         a.set_ylabel("u(x)")
-        a.set_title(f"k = {k / np.pi:g}π   ({config_label(mu, hard_bc, stretch, optimizer, mu_auto)})")
+        a.set_title(f"test k = {k_test / np.pi:.4f}π   ({test_kind}, not a training point)")
         a.legend(loc="best")
 
         a = ax[0, 1]
@@ -380,192 +437,61 @@ def run(k, n_coll=N_COLLOCATION, sampler=SAMPLER, resample=RESAMPLE, mu=MU,
         a.axhline(0, color=MUTED, lw=0.6)
         a.set_xlabel("x")
         a.set_ylabel("u_exact - u_PINN")
-        a.set_title(f"pointwise error,  rel. L2 = {rel_err:.2e}")
+        a.set_title(f"pointwise error at test k,  rel. L2 = {rel_err:.2e}")
 
         a = ax[1, 0]
-        n_max = max(40, int(3 * k / np.pi))
+        n_max = max(40, int(3 * k_test / np.pi))
         modes = np.arange(1, n_max + 1)
         a.semilogy(modes, ex_spec[:n_max], "o", color=MUTED, ms=5, mfc="none",
                    label="exact  |ûₙ| / ‖û‖")
         a.semilogy(modes, rel_spec[:n_max], "o-", color=BLUE, ms=4, lw=1,
                    label="error  |êₙ| / ‖û‖")
-        a.axvline(k / np.pi, color=ORANGE, lw=1, ls="--", label=f"k/π = {k / np.pi:g}")
+        a.axvline(k_test / np.pi, color=ORANGE, lw=1, ls="--", label=f"k/π = {k_test / np.pi:.4f}")
         a.set_xlabel("sine mode n")
         a.set_ylabel("coefficient / ‖û‖")
-        title = f"error spectrum (sine FFT),  n*={n_star}: {share_star:.0%}"
+        title = f"error spectrum at test k,  n*={n_star}: {share_star:.0%}"
         if top[0] != n_star:
             title += f",  top n={top[0]}: {energy[top[0] - 1]:.0%}"
         a.set_title(title)
         a.legend(loc="upper right")
 
         a = ax[1, 1]
-        if optimizer == "lm":
-            a.semilogy(np.arange(len(hist_lm)), hist_lm, color=BLUE, lw=1.2,
-                       label="Levenberg–Marquardt (per iteration)")
-            a.set_xlabel("LM iteration")
-            a.set_title(f"loss:  after LM {loss_final:.2e}  ({lm_iters} iterations)")
-        else:
-            a.semilogy(np.arange(len(hist_adam)), hist_adam, color=BLUE, lw=0.8,
-                       label="Adam (per iteration)")
-            if hist_lbfgs:
-                a.semilogy(len(hist_adam) + np.arange(len(hist_lbfgs)), hist_lbfgs,
-                           color=ORANGE, lw=1.2, label="L-BFGS (per evaluation)")
-            a.set_xlabel("step")
-            a.set_title(f"loss:  after Adam {loss_adam:.2e},  after L-BFGS {loss_final:.2e}")
-        a.set_ylabel("loss")
-        a.legend(loc="upper right")
+        a.semilogy(k_curve / np.pi, curve_rel, "o-", color=VIOLET, lw=1.5, ms=3)
+        for m in res_in:
+            a.axvline(m, color=MUTED, lw=0.8, ls="--")
+        a.semilogy([k_test / np.pi], [rel_err], "o", color=ORANGE, ms=9)
+        a.set_xlabel("k / π" + ("     (dashed: resonances)" if res_in else ""))
+        a.set_ylabel("relative error  ‖u − û‖ / ‖u‖")
+        a.set_title(f"error across the k range,  median {np.median(curve_rel):.2e}  "
+                    f"(orange: test k)")
+        lo, hi = a.get_ylim()
+        decades = np.log10(hi / lo)
+        if decades < 3:
+            if decades < 1:
+                a.yaxis.set_major_locator(MaxNLocator(nbins=5))
+            else:
+                a.yaxis.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 5.0)))
+            a.yaxis.set_minor_locator(NullLocator())
+            a.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
 
         for a in ax.ravel():
             a.grid(color=GRID, lw=0.6)
             a.set_axisbelow(True)
 
+        fig.suptitle(f"NN(x, k) trained on {k_min / np.pi:g}π ≤ k ≤ {k_max / np.pi:g}π     "
+                     f"({config_label(mu, hard_bc, scale_k, optimizer, mu_auto)},  "
+                     f"{points.replace('pi', 'π')})", fontsize=13)
         plt.tight_layout()
-        tag = config_tag(mu, hard_bc, stretch, optimizer, mu_auto)
-        path = f"figures/pinn_kpi{k / np.pi:g}_{tag}.png"
+        path = f"figures/{stem}_test{k_test / np.pi:.4f}.png"
         plt.savefig(path, dpi=140)
         plt.close(fig)
         if verbose:
             print(f"saved {path}")
 
-    return dict(kpi=k / np.pi, k=k, n_star=n_star, gap=gap, mu=mu, mu_auto=mu_auto, hard_bc=hard_bc,
-                stretch=stretch, optimizer=optimizer, n_coll=n_coll, u_l2=u_l2, u_max=u_max,
-                beta_star=beta_star, err_l2=err_l2, err_max=err_max, rel_err=rel_err,
-                share_star=share_star, loss_adam=loss_adam, pde_adam=pde_adam, bc_adam=bc_adam,
-                loss_final=loss_final, pde_final=pde_final, bc_final=bc_final,
-                max_res=res_dense, lbfgs_evals=len(hist_lbfgs), lm_iters=lm_iters,
-                spec_shape=spec_shape)
-
-
-CSV_KEYS = ["kpi", "k", "n_star", "gap", "mu", "mu_auto", "hard_bc", "stretch", "optimizer",
-            "n_coll", "u_l2", "u_max", "beta_star", "err_l2", "err_max", "rel_err", "share_star",
-            "loss_adam", "pde_adam", "bc_adam", "loss_final", "pde_final", "bc_final", "max_res",
-            "lbfgs_evals", "lm_iters"]
-
-
-def summarize(rows):
-    mu, hard_bc, stretch = rows[0]["mu"], rows[0]["hard_bc"], rows[0]["stretch"]
-    optimizer, mu_auto = rows[0]["optimizer"], rows[0]["mu_auto"]
-    lm = optimizer == "lm"
-    kpis = [r["kpi"] for r in rows]
-    tag = config_tag(mu, hard_bc, stretch, optimizer, mu_auto)
-    stem = f"resonance_kpi{min(kpis):g}-{max(kpis):g}_{tag}"
-
-    os.makedirs("results", exist_ok=True)
-    with open(f"results/{stem}.csv", "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(CSV_KEYS)
-        for r in rows:
-            w.writerow([r[key] for key in CSV_KEYS])
-
-    ns = rows[0]["n_star"]
-    print("\n" + "=" * 78)
-    print(f"SUMMARY   {config_label(mu, hard_bc, stretch, optimizer, mu_auto, ascii=True)}")
-    print(f"{'k/pi':>9} {'gap':>8} {'mu':>10} {'||u||':>10} {'|beta_' + str(ns) + '|':>10} "
-          f"{'||err||':>10} {'rel_err':>10} {'share_' + str(ns):>9} "
-          + (f"{'loss_LM':>10}" if lm else f"{'loss_Adam':>10} {'loss_LBFGS':>10}"))
-    for r in rows:
-        mu_txt = "-" if hard_bc else f"{r['mu']:.3e}"
-        print(f"{r['kpi']:>9g} {r['gap']:>8.2f} {mu_txt:>10} {r['u_l2']:>10.3e} "
-              f"{r['beta_star']:>10.3e} {r['err_l2']:>10.3e} {r['rel_err']:>10.3e} "
-              f"{r['share_star']:>9.1%} "
-              + (f"{r['loss_final']:>10.3e}" if lm
-                 else f"{r['loss_adam']:>10.3e} {r['loss_final']:>10.3e}"))
-    print(f"\nsaved results/{stem}.csv")
-
-    if len(rows) < 2:
-        return
-
-    rows = sorted(rows, key=lambda r: -r["gap"])
-    d = np.array([abs(r["kpi"] - r["n_star"]) for r in rows])
-    gaps = np.array([r["gap"] for r in rows])
-
-    def col(key):
-        return np.array([r[key] for r in rows])
-
-    def guide(a, y0):
-        a.loglog(d, y0 * gaps[0] / gaps, ":", color=MUTED, lw=1.2,
-                 label="×2 per halving (∝ 1/gap)")
-
-    fig, ax = plt.subplots(2, 3, figsize=(17, 9.5))
-
-    a = ax[0, 0]
-    a.loglog(d, col("u_l2"), "o-", color=INK, lw=2, ms=7, label="‖u‖ (L2)")
-    a.loglog(d, col("u_max"), "s--", color=INK, lw=1.5, ms=6, label="max |u|")
-    a.loglog(d, col("beta_star"), "o-", color=VIOLET, lw=2, ms=7,
-             label=f"|β_{ns}|  (mode-{ns} part of u)")
-    guide(a, col("u_l2")[0])
-    a.set_title("1.  Does u blow up?")
-    a.set_ylabel("size of exact solution")
-
-    a = ax[0, 1]
-    a.loglog(d, col("err_l2"), "o-", color=BLUE, lw=2, ms=7, label="‖u − û‖ (L2)")
-    a.loglog(d, col("err_max"), "s--", color=BLUE, lw=1.5, ms=6, label="max |u − û|")
-    guide(a, col("err_l2")[0])
-    a.set_title("2a.  Does the error blow up?  (absolute)")
-    a.set_ylabel("error")
-
-    a = ax[0, 2]
-    a.loglog(d, col("rel_err"), "o-", color=BLUE, lw=2, ms=7, label="‖u − û‖ / ‖u‖")
-    a.set_title("2b.  Does the error blow up?  (relative to u)")
-    a.set_ylabel("relative error")
-
-    a = ax[1, 0]
-    n_max = max(20, 3 * ns)
-    modes = np.arange(1, n_max + 1)
-    colors = RAMP if len(rows) <= len(RAMP) else plt.cm.Blues(np.linspace(0.4, 1.0, len(rows)))
-    for r, c in zip(rows, colors):
-        a.semilogy(modes, r["spec_shape"][:n_max], "o-", color=c, lw=1.5, ms=4,
-                   label=f"k = {r['kpi']:g}π")
-    a.axvline(ns, color=MUTED, lw=0.8, ls="--")
-    a.xaxis.set_major_locator(MaxNLocator(integer=True))
-    a.set_xlabel("sine mode n")
-    a.set_ylabel("|êₙ| / ‖ê‖")
-    a.set_title("3a.  Does the error spectrum get peakier?")
-
-    a = ax[1, 1]
-    a.semilogx(d, 100 * col("share_star"), "o-", color=VIOLET, lw=2, ms=7,
-               label=f"share of error in mode {ns}")
-    a.set_ylim(0, 100)
-    a.set_ylabel("% of error energy")
-    a.set_title(f"3b.  Share of the error in mode {ns}")
-
-    a = ax[1, 2]
-    if lm:
-        a.loglog(d, col("loss_final"), "o-", color=BLUE, lw=2, ms=7, label="after LM")
-    else:
-        a.loglog(d, col("loss_adam"), "o-", color=BLUE, lw=2, ms=7, label="after Adam")
-        a.loglog(d, col("loss_final"), "o-", color=ORANGE, lw=2, ms=7, label="after L-BFGS")
-    a.set_title("4.  Does the loss get larger?")
-    a.set_ylabel("loss  (pde)" if hard_bc else "loss  (pde + μ · bc)")
-
-    for a in ax.ravel():
-        if a.get_yscale() == "log":
-            lo, hi = a.get_ylim()
-            subs = (1.0, 2.0, 5.0) if np.log10(hi / lo) < 3 else (1.0,)
-            a.yaxis.set_major_locator(LogLocator(base=10, subs=subs))
-            a.yaxis.set_minor_locator(NullLocator())
-            a.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
-        a.grid(color=GRID, lw=0.6, which="major")
-        a.set_axisbelow(True)
-        if len(a.get_legend_handles_labels()[0]) > 1:
-            a.legend(loc="best")
-    for a in [ax[0, 0], ax[0, 1], ax[0, 2], ax[1, 1], ax[1, 2]]:
-        a.set_xticks(d)
-        a.set_xticklabels([f"{r['kpi']:g}" for r in rows])
-        a.xaxis.set_minor_locator(NullLocator())
-        a.invert_xaxis()
-        a.set_xlabel(f"k / π     (log scale, closer to {ns} →)")
-
-    fig.suptitle(f"Approaching resonance k → {ns}π     "
-                 f"({config_label(mu, hard_bc, stretch, optimizer, mu_auto)},  "
-                 f"n_coll = {rows[0]['n_coll']})",
-                 fontsize=13)
-    plt.tight_layout()
-    os.makedirs("figures", exist_ok=True)
-    path = f"figures/{stem}.png"
-    plt.savefig(path, dpi=140)
-    plt.close(fig)
-    print(f"saved {path}")
+    return dict(k_min=k_min, k_max=k_max, k_test=k_test, n_star=n_star, gap=gap, mu=mu,
+                u_l2=u_l2, err_l2=err_l2, rel_err=rel_err, share_star=share_star,
+                loss_final=loss_final, max_res=res_test, lm_iters=lm_iters,
+                k_curve=k_curve, curve_rel=curve_rel)
 
 
 def mu_arg(s):
@@ -574,22 +500,27 @@ def mu_arg(s):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--kpi", type=float, nargs="+", default=KPI_SWEEP)
+    p.add_argument("--k-min", type=float, default=K_MIN)
+    p.add_argument("--k-max", type=float, default=K_MAX)
+    p.add_argument("--k-test", type=float, default=K_TEST)
     p.add_argument("--n-coll", type=int, default=N_COLLOCATION)
-    p.add_argument("--sampler", default=SAMPLER)
-    p.add_argument("--resample", action="store_true", default=RESAMPLE)
+    p.add_argument("--n-bc", type=int, default=N_BOUNDARY)
+    p.add_argument("--focus", type=float, default=FOCUS)
+    p.add_argument("--focus-width", type=float, default=FOCUS_WIDTH)
+    p.add_argument("--raw-k", action="store_true")
     p.add_argument("--optimizer", choices=["lm", "adam"], default=OPTIMIZER)
     p.add_argument("--mu", type=mu_arg, default=MU)
-    p.add_argument("--mu-power", type=float, default=MU_POWER)
     p.add_argument("--hard-bc", action="store_true", default=HARD_BC)
-    p.add_argument("--stretch", action="store_true", default=STRETCH)
     p.add_argument("--lm-iter", type=int, default=LM_ITER)
     p.add_argument("--n-iter", type=int, default=N_ITER)
     p.add_argument("--lbfgs-iter", type=int, default=LBFGS_ITER)
+    p.add_argument("--width", type=int, default=WIDTH)
+    p.add_argument("--depth", type=int, default=DEPTH)
     p.add_argument("--seed", type=int, default=SEED)
     a = p.parse_args()
-    rows = [run(kpi * np.pi, a.n_coll, a.sampler, a.resample, a.mu, a.n_iter,
-                a.lbfgs_iter, a.seed, hard_bc=a.hard_bc, stretch=a.stretch, mu_power=a.mu_power,
-                optimizer=a.optimizer, lm_iter=a.lm_iter)
-            for kpi in a.kpi]
-    summarize(rows)
+    run(k_min=a.k_min * np.pi, k_max=a.k_max * np.pi,
+        k_test=None if a.k_test is None else a.k_test * np.pi, n_coll=a.n_coll, n_bc=a.n_bc,
+        focus=a.focus, focus_width=a.focus_width * np.pi,
+        mu=a.mu, scale_k=not a.raw_k, hard_bc=a.hard_bc, optimizer=a.optimizer,
+        lm_iter=a.lm_iter, n_iter=a.n_iter, lbfgs_iter=a.lbfgs_iter, width=a.width,
+        depth=a.depth, seed=a.seed)
