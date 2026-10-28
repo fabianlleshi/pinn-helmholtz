@@ -145,6 +145,18 @@ def pairs(x, k):
     return torch.tensor(np.stack([x, np.full_like(x, k)], axis=1))
 
 
+def on_grid(net, x, ks):
+    X = torch.tensor(np.stack([np.tile(x, len(ks)), np.repeat(ks, len(x))], axis=1))
+    with torch.no_grad():
+        return net(X).numpy().reshape(len(ks), len(x)).T
+
+
+def close_to_resonances(k_min, k_max):
+    d = np.pi * np.logspace(-6, -2, 15)
+    ks = np.array([m * np.pi + s * d for m in resonances_in(k_min, k_max) for s in (-1, 1)]).ravel()
+    return ks[(ks > k_min) & (ks < k_max)]
+
+
 class PINN(nn.Module):
     def __init__(self, k_min, k_max, hard_bc=HARD_BC, scale_k=SCALE_K, width=WIDTH, depth=DEPTH):
         super().__init__()
@@ -375,13 +387,15 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
 
     k_curve = k_min + (np.arange(N_K_CURVE) + 0.5) * (k_max - k_min) / N_K_CURVE
     U_ex = u_exact_many(xs, k_curve)
-    Xg = torch.tensor(np.stack([np.tile(xs, N_K_CURVE), np.repeat(k_curve, len(xs))], axis=1))
-    with torch.no_grad():
-        U_nn = net(Xg).numpy().reshape(N_K_CURVE, len(xs)).T
+    U_nn = on_grid(net, xs, k_curve)
     curve_u = l2(U_ex, axis=0)
+    curve_nn = l2(U_nn, axis=0)
     curve_err = l2(U_ex - U_nn, axis=0)
     curve_rel = curve_err / curve_u
     worst = curve_rel.argmax()
+    k_norm = np.sort(np.r_[k_curve, close_to_resonances(k_min, k_max)])
+    norm_u = l2(u_exact_many(xs, k_norm), axis=0)
+    norm_nn = l2(on_grid(net, xs, k_norm), axis=0)
 
     if verbose:
         if optimizer == "lm":
@@ -404,6 +418,8 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
         print(f"\nacross the range ({N_K_CURVE} k values)   relative error: median "
               f"{np.median(curve_rel):.3e}   worst {curve_rel[worst]:.3e} "
               f"at k = {k_curve[worst] / np.pi:.4f}pi")
+        print(f"solution norm    exact max {norm_u.max():.3e} at k = {k_norm[norm_u.argmax()] / np.pi:.6f}pi"
+              f"   PINN max {norm_nn.max():.3e} at k = {k_norm[norm_nn.argmax()] / np.pi:.4f}pi")
 
     tag = config_tag(mu, hard_bc, scale_k, optimizer, mu_auto)
     stem = (f"param_k{k_min / np.pi:g}-{k_max / np.pi:g}_{tag}"
@@ -412,19 +428,22 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
     os.makedirs("results", exist_ok=True)
     with open(f"results/{stem}.csv", "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["kpi", "k", "n_star", "gap", "u_l2", "err_l2", "rel_err", "test"])
-        for kc, ul, el, rl in zip(k_curve, curve_u, curve_err, curve_rel):
+        w.writerow(["kpi", "k", "n_star", "gap", "u_l2", "nn_l2", "err_l2", "rel_err", "test"])
+        for kc, ul, nl, el, rl in zip(k_curve, curve_u, curve_nn, curve_err, curve_rel):
             ns, gp = nearest_resonance(kc)
-            w.writerow([kc / np.pi, kc, ns, gp, ul, el, rl, 0])
-        w.writerow([k_test / np.pi, k_test, n_star, gap, u_l2, err_l2, rel_err, 1])
+            w.writerow([kc / np.pi, kc, ns, gp, ul, nl, el, rl, 0])
+        w.writerow([k_test / np.pi, k_test, n_star, gap, u_l2, l2(u_nn), err_l2, rel_err, 1])
     if verbose:
         print(f"\nsaved results/{stem}.csv")
 
     if plot:
         os.makedirs("figures", exist_ok=True)
-        fig, ax = plt.subplots(2, 2, figsize=(12, 8))
+        fig = plt.figure(figsize=(18, 9.5))
+        gs = fig.add_gridspec(2, 6)
+        ax = [fig.add_subplot(gs[0, 0:2]), fig.add_subplot(gs[0, 2:4]), fig.add_subplot(gs[0, 4:6]),
+              fig.add_subplot(gs[1, 0:3]), fig.add_subplot(gs[1, 3:6])]
 
-        a = ax[0, 0]
+        a = ax[0]
         a.plot(xs, u_ex, color=INK, lw=2, label="real (exact Fourier)")
         a.plot(xs, u_nn, color=BLUE, lw=2, ls="--", label="tested (PINN)")
         a.set_xlabel("x")
@@ -432,14 +451,14 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
         a.set_title(f"test k = {k_test / np.pi:.4f}π   ({test_kind}, not a training point)")
         a.legend(loc="best")
 
-        a = ax[0, 1]
+        a = ax[1]
         a.plot(xs, err, color=BLUE, lw=1.5)
         a.axhline(0, color=MUTED, lw=0.6)
         a.set_xlabel("x")
         a.set_ylabel("u_exact - u_PINN")
         a.set_title(f"pointwise error at test k,  rel. L2 = {rel_err:.2e}")
 
-        a = ax[1, 0]
+        a = ax[2]
         n_max = max(40, int(3 * k_test / np.pi))
         modes = np.arange(1, n_max + 1)
         a.semilogy(modes, ex_spec[:n_max], "o", color=MUTED, ms=5, mfc="none",
@@ -455,7 +474,7 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
         a.set_title(title)
         a.legend(loc="upper right")
 
-        a = ax[1, 1]
+        a = ax[3]
         a.semilogy(k_curve / np.pi, curve_rel, "o-", color=VIOLET, lw=1.5, ms=3)
         for m in res_in:
             a.axvline(m, color=MUTED, lw=0.8, ls="--")
@@ -474,7 +493,18 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
             a.yaxis.set_minor_locator(NullLocator())
             a.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
 
-        for a in ax.ravel():
+        a = ax[4]
+        a.semilogy(k_norm / np.pi, norm_u, "-", color=INK, lw=2, label="exact  ‖u(k)‖")
+        a.semilogy(k_norm / np.pi, norm_nn, "--", color=BLUE, lw=2, label="PINN  ‖û(k)‖")
+        for m in res_in:
+            a.axvline(m, color=MUTED, lw=0.8, ls="--")
+        a.set_xlabel("k / π" + ("     (dashed: resonances)" if res_in else ""))
+        a.set_ylabel("L2 norm over x")
+        a.set_title(f"solution size across k,  max ‖û‖ = {norm_nn.max():.2e},  "
+                    f"max ‖u‖ = {norm_u.max():.2e}")
+        a.legend(loc="best")
+
+        for a in ax:
             a.grid(color=GRID, lw=0.6)
             a.set_axisbelow(True)
 
@@ -491,7 +521,7 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
     return dict(k_min=k_min, k_max=k_max, k_test=k_test, n_star=n_star, gap=gap, mu=mu,
                 u_l2=u_l2, err_l2=err_l2, rel_err=rel_err, share_star=share_star,
                 loss_final=loss_final, max_res=res_test, lm_iters=lm_iters,
-                k_curve=k_curve, curve_rel=curve_rel)
+                k_curve=k_curve, curve_rel=curve_rel, k_norm=k_norm, norm_u=norm_u, norm_nn=norm_nn)
 
 
 def mu_arg(s):
