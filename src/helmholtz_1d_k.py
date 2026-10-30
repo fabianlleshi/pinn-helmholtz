@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 from torch.func import functional_call, grad, jacrev, vmap
 from scipy.fft import dst
-from scipy.integrate import quad
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -37,6 +36,7 @@ LR = 1e-3
 WIDTH = 32
 DEPTH = 3
 N_MODES = 1000
+N_FINE = 2**17
 N_K_CURVE = 100
 SEED = 5
 
@@ -62,23 +62,44 @@ def f_torch(x):
     return torch.exp(-20.0 * x**2)
 
 
+def sine_coefficients(values):
+    return dst(values[1:-1], type=1) / (len(values) - 1)
+
+
 n = np.arange(1, N_MODES + 1)
-gamma = np.array([
-    2.0 * quad(lambda x, m=m: f_np(x) * np.sin(m * np.pi * x), 0, 1, limit=400)[0]
-    for m in n
-])
+x_fine = np.linspace(0.0, 1.0, N_FINE + 1)
+gamma = sine_coefficients(f_np(x_fine))[:N_MODES]
 
 
-def exact_coefficients(k):
-    return gamma / (n**2 * np.pi**2 - k**2)
+def forcing_np(x, k, forcing="real"):
+    if forcing == "real":
+        return f_np(x)
+    if forcing == "imag":
+        return 1j * f_np(x)
+    if forcing == "harmonic":
+        return f_np(x) * np.exp(1j * k * x)
+    raise ValueError(forcing)
 
 
-def u_exact(x, k):
-    return (exact_coefficients(k)[None, :] * np.sin(np.outer(x, n * np.pi))).sum(axis=1)
+def forcing_coefficients(k, forcing="real"):
+    if forcing == "real":
+        return gamma
+    if forcing == "imag":
+        return 1j * gamma
+    return sine_coefficients(forcing_np(x_fine, k, forcing))[:N_MODES]
 
 
-def u_exact_many(x, ks):
-    coeffs = np.stack([exact_coefficients(k) for k in ks], axis=1)
+def exact_coefficients(k, eta=0.0, forcing="real"):
+    kappa2 = k**2 if eta == 0 else (k - 1j * eta)**2
+    return forcing_coefficients(k, forcing) / (n**2 * np.pi**2 - kappa2)
+
+
+def u_exact(x, k, eta=0.0, forcing="real"):
+    return (exact_coefficients(k, eta, forcing)[None, :] * np.sin(np.outer(x, n * np.pi))).sum(axis=1)
+
+
+def u_exact_many(x, ks, eta=0.0, forcing="real"):
+    coeffs = np.stack([exact_coefficients(k, eta, forcing) for k in ks], axis=1)
     return np.sin(np.outer(x, n * np.pi)) @ coeffs
 
 
@@ -92,12 +113,8 @@ def resonances_in(k_min, k_max):
     return [int(m) for m in n if k_min - 1e-9 <= m * np.pi <= k_max + 1e-9]
 
 
-def sine_coefficients(values):
-    return dst(values[1:-1], type=1) / (len(values) - 1)
-
-
 def l2(values, axis=None):
-    return np.sqrt(np.mean(values**2, axis=axis))
+    return np.sqrt(np.mean(np.abs(values)**2, axis=axis))
 
 
 def config_tag(mu, hard_bc, scale_k, optimizer, mu_auto):
