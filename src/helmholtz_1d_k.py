@@ -7,7 +7,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.func import functional_call, grad, jacrev, vmap
+from torch.func import functional_call, jacrev, vmap
 from scipy.fft import dst
 import matplotlib
 matplotlib.use("Agg")
@@ -24,6 +24,7 @@ N_COLLOCATION = 1000
 N_BOUNDARY = 50
 FOCUS = 0.0
 FOCUS_WIDTH = 0.1
+FORCING = "real"
 SCALE_K = True
 OPTIMIZER = "lm"
 MU = "auto"
@@ -60,6 +61,18 @@ def f_np(x):
 
 def f_torch(x):
     return torch.exp(-20.0 * x**2)
+
+
+def forcing_torch(x, k, forcing="real"):
+    f = f_torch(x)
+    if forcing == "real":
+        return f, torch.zeros_like(f)
+    if forcing == "imag":
+        return torch.zeros_like(f), f
+    raise ValueError(forcing)
+
+
+FORCING_LABEL = {"real": "f(x)", "imag": "i·f(x)"}
 
 
 def sine_coefficients(values):
@@ -117,9 +130,9 @@ def l2(values, axis=None):
     return np.sqrt(np.mean(np.abs(values)**2, axis=axis))
 
 
-def config_tag(mu, hard_bc, scale_k, optimizer, mu_auto):
+def config_tag(mu, hard_bc, scale_k, optimizer, mu_auto, forcing="real"):
     bc = "hard" if hard_bc else ("muauto" if mu_auto else f"mu{mu:g}")
-    return f"{bc}_{'kscaled' if scale_k else 'kraw'}_{optimizer}"
+    return f"{bc}_{'kscaled' if scale_k else 'kraw'}_{optimizer}" + ("" if forcing == "real" else f"_{forcing}")
 
 
 def config_label(mu, hard_bc, scale_k, optimizer, mu_auto, ascii=False):
@@ -162,10 +175,14 @@ def pairs(x, k):
     return torch.tensor(np.stack([x, np.full_like(x, k)], axis=1))
 
 
+def as_complex(v):
+    return v[..., 0] if v.shape[-1] == 1 else v[..., 0] + 1j * v[..., 1]
+
+
 def on_grid(net, x, ks):
     X = torch.tensor(np.stack([np.tile(x, len(ks)), np.repeat(ks, len(x))], axis=1))
     with torch.no_grad():
-        return net(X).numpy().reshape(len(ks), len(x)).T
+        return as_complex(net(X).numpy()).reshape(len(ks), len(x)).T
 
 
 def close_to_resonances(k_min, k_max):
@@ -175,13 +192,14 @@ def close_to_resonances(k_min, k_max):
 
 
 class PINN(nn.Module):
-    def __init__(self, k_min, k_max, hard_bc=HARD_BC, scale_k=SCALE_K, width=WIDTH, depth=DEPTH):
+    def __init__(self, k_min, k_max, hard_bc=HARD_BC, scale_k=SCALE_K, width=WIDTH, depth=DEPTH, n_out=1):
         super().__init__()
         layers = [nn.Linear(2, width), nn.Tanh()]
         for _ in range(depth - 1):
             layers += [nn.Linear(width, width), nn.Tanh()]
-        layers += [nn.Linear(width, 1)]
+        layers += [nn.Linear(width, n_out)]
         self.net = nn.Sequential(*layers)
+        self.n_out = n_out
         self.hard_bc = hard_bc
         self.scale_k = scale_k
         self.k_mid = 0.5 * (k_min + k_max)
@@ -196,23 +214,35 @@ class PINN(nn.Module):
         return u
 
 
-def residual(net, X):
+def pde_residual(u_xx, u, x, k, eta=0.0, forcing="real"):
+    if u.shape[-1] == 1:
+        return u_xx + k**2 * u + f_torch(x)
+    f_re, f_im = forcing_torch(x, k, forcing)
+    a2, b2 = k**2 - eta**2, -2.0 * k * eta
+    re = u_xx[..., 0:1] + a2 * u[..., 0:1] - b2 * u[..., 1:2] + f_re
+    im = u_xx[..., 1:2] + a2 * u[..., 1:2] + b2 * u[..., 0:1] + f_im
+    return torch.cat([re, im], dim=-1)
+
+
+def residual(net, X, eta=0.0, forcing="real"):
     X = X.detach().requires_grad_(True)
     u = net(X)
-    u_x = torch.autograd.grad(u, X, torch.ones_like(u), create_graph=True)[0][:, 0:1]
-    u_xx = torch.autograd.grad(u_x, X, torch.ones_like(u_x), create_graph=True)[0][:, 0:1]
-    x, k = X[:, 0:1], X[:, 1:2]
-    return u_xx + k**2 * u + f_torch(x)
+    u_xx = []
+    for j in range(u.shape[1]):
+        u_x = torch.autograd.grad(u[:, j:j + 1], X, torch.ones_like(u[:, j:j + 1]), create_graph=True)[0][:, 0:1]
+        u_xx.append(torch.autograd.grad(u_x, X, torch.ones_like(u_x), create_graph=True)[0][:, 0:1])
+    return pde_residual(torch.cat(u_xx, dim=1), u, X[:, 0:1], X[:, 1:2], eta, forcing)
 
 
 def flat_params(net):
     return torch.cat([p.detach().reshape(-1) for p in net.parameters()])
 
 
-def functional_parts(net, X, Xb):
+def functional_parts(net, X, Xb, eta=0.0, forcing="real"):
     names = [nm for nm, _ in net.named_parameters()]
     shapes = [p.shape for _, p in net.named_parameters()]
     sizes = [p.numel() for _, p in net.named_parameters()]
+    n_par = sum(sizes)
 
     def unflat(t):
         out, i = {}, 0
@@ -222,30 +252,31 @@ def functional_parts(net, X, Xb):
         return out
 
     def u_point(t, p):
-        return functional_call(net, unflat(t), (p.reshape(1, 2),)).reshape(())
+        return functional_call(net, unflat(t), (p.reshape(1, 2),)).reshape(-1)
 
     def u_x(t, p):
-        return grad(u_point, argnums=1)(t, p)[0]
+        return jacrev(u_point, argnums=1)(t, p)[:, 0]
 
     def r_point(t, p):
-        return grad(u_x, argnums=1)(t, p)[0] + p[1]**2 * u_point(t, p) + f_torch(p[0])
+        return pde_residual(jacrev(u_x, argnums=1)(t, p)[:, 0], u_point(t, p), p[0], p[1], eta, forcing)
 
     X, Xb = X.detach(), Xb.detach()
     r_all = vmap(r_point, in_dims=(None, 0))
     u_all = vmap(u_point, in_dims=(None, 0))
     jr_all = vmap(jacrev(r_point), in_dims=(None, 0))
     ju_all = vmap(jacrev(u_point), in_dims=(None, 0))
-    return (lambda t: r_all(t, X), lambda t: u_all(t, Xb),
-            lambda t: jr_all(t, X), lambda t: ju_all(t, Xb))
+    return (lambda t: r_all(t, X).reshape(-1), lambda t: u_all(t, Xb).reshape(-1),
+            lambda t: jr_all(t, X).reshape(-1, n_par), lambda t: ju_all(t, Xb).reshape(-1, n_par))
 
 
 def ntk_mu(j_pde, j_bc):
     return ((j_pde**2).sum(1).mean() / (j_bc**2).sum(1).mean()).item()
 
 
-def train_lm(net, X, Xb, mu, mu_auto, hard_bc, lm_iter, verbose):
-    r_fn, b_fn, jr_fn, jb_fn = functional_parts(net, X, Xb)
+def train_lm(net, X, Xb, mu, mu_auto, hard_bc, lm_iter, verbose, eta=0.0, forcing="real"):
+    r_fn, b_fn, jr_fn, jb_fn = functional_parts(net, X, Xb, eta, forcing)
     n_c, n_b = X.shape[0], Xb.shape[0]
+    n_r = n_c * net.n_out
     auto = mu_auto and not hard_bc
     theta = flat_params(net)
 
@@ -290,8 +321,8 @@ def train_lm(net, X, Xb, mu, mu_auto, hard_bc, lm_iter, verbose):
                 break
             lam *= 2
         if verbose and it % 500 == 0:
-            pde = (rv[:n_c]**2).sum().item()
-            bc = 0.0 if hard_bc else (rv[n_c:]**2).sum().item() / mu
+            pde = (rv[:n_r]**2).sum().item()
+            bc = 0.0 if hard_bc else (rv[n_r:]**2).sum().item() / mu
             print(f"LM iter {it:5d}   loss {loss:.3e}   (pde {pde:.3e}, bc {bc:.3e})"
                   + ("" if hard_bc else f"   mu {mu:.3e}") + f"   {time.time() - t0:.0f}s")
         if not accepted or loss < 1e-24:
@@ -304,13 +335,15 @@ def train_lm(net, X, Xb, mu, mu_auto, hard_bc, lm_iter, verbose):
 def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOCATION,
         n_bc=N_BOUNDARY, focus=FOCUS, focus_width=FOCUS_WIDTH * np.pi, mu=MU, scale_k=SCALE_K,
         hard_bc=HARD_BC, optimizer=OPTIMIZER, lm_iter=LM_ITER, n_iter=N_ITER,
-        lbfgs_iter=LBFGS_ITER, width=WIDTH, depth=DEPTH, seed=SEED, verbose=True, plot=True):
+        lbfgs_iter=LBFGS_ITER, width=WIDTH, depth=DEPTH, seed=SEED, forcing=FORCING, eta=0.0,
+        verbose=True, plot=True):
     mu_auto = mu == "auto"
     mu = 0.0 if mu_auto else float(mu)
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    net = PINN(k_min, k_max, hard_bc=hard_bc, scale_k=scale_k, width=width, depth=depth)
+    n_out = 1 if forcing == "real" and eta == 0 else 2
+    net = PINN(k_min, k_max, hard_bc=hard_bc, scale_k=scale_k, width=width, depth=depth, n_out=n_out)
     X, Xb = sample_points(n_coll, n_bc, k_min, k_max, focus, focus_width)
     test_kind = "random" if k_test is None else "chosen"
     if k_test is None:
@@ -326,19 +359,21 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
         steps = (f"lm_iter = {lm_iter}" if optimizer == "lm"
                  else f"n_iter = {n_iter}   lbfgs_iter = {lbfgs_iter}")
         print(f"{config_label(mu, hard_bc, scale_k, optimizer, mu_auto, ascii=True)}   "
-              f"{points}   n_bc = {n_bc}   width = {width}   depth = {depth}   {steps}\n")
+              f"{points}   n_bc = {n_bc}   width = {width}   depth = {depth}   {steps}")
+        print(f"forcing {FORCING_LABEL[forcing].replace('·', '*')}"
+              + ("   complex solution: the network outputs Re u and Im u" if n_out == 2 else "") + "\n")
 
     hist_lbfgs = []
     lm_iters = 0
 
     def loss_parts():
-        return (residual(net, X)**2).mean(), (net(Xb)**2).mean()
+        return (residual(net, X, eta, forcing)**2).sum(1).mean(), (net(Xb)**2).sum(1).mean()
 
     if optimizer == "lm":
-        mu, lm_iters = train_lm(net, X, Xb, mu, mu_auto, hard_bc, lm_iter, verbose)
+        mu, lm_iters = train_lm(net, X, Xb, mu, mu_auto, hard_bc, lm_iter, verbose, eta, forcing)
     else:
         auto = mu_auto and not hard_bc
-        jr_fn, jb_fn = functional_parts(net, X, Xb)[2:]
+        jr_fn, jb_fn = functional_parts(net, X, Xb, eta, forcing)[2:]
         if auto:
             theta = flat_params(net)
             mu = ntk_mu(jr_fn(theta), jb_fn(theta))
@@ -380,11 +415,11 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
 
     xs = np.linspace(0.0, 1.0, 2001)
     n_star, gap = nearest_resonance(k_test)
-    u_ex = u_exact(xs, k_test)
+    u_ex = u_exact(xs, k_test, eta, forcing)
     X_test = pairs(xs, k_test)
-    res_test = residual(net, X_test).abs().max().item()
+    res_test = np.abs(as_complex(residual(net, X_test, eta, forcing).detach().numpy())).max()
     with torch.no_grad():
-        u_nn = net(X_test).numpy().ravel()
+        u_nn = as_complex(net(X_test).numpy())
 
     err = u_ex - u_nn
     u_l2 = l2(u_ex)
@@ -398,12 +433,12 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
     ref = np.linalg.norm(ex_hat)
     rel_spec = np.abs(err_hat) / ref
     ex_spec = np.abs(ex_hat) / ref
-    energy = err_hat**2 / (err_hat**2).sum()
+    energy = np.abs(err_hat)**2 / (np.abs(err_hat)**2).sum()
     share_star = energy[n_star - 1]
     top = np.argsort(energy)[::-1][:3] + 1
 
     k_curve = k_min + (np.arange(N_K_CURVE) + 0.5) * (k_max - k_min) / N_K_CURVE
-    U_ex = u_exact_many(xs, k_curve)
+    U_ex = u_exact_many(xs, k_curve, eta, forcing)
     U_nn = on_grid(net, xs, k_curve)
     curve_u = l2(U_ex, axis=0)
     curve_nn = l2(U_nn, axis=0)
@@ -411,7 +446,7 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
     curve_rel = curve_err / curve_u
     worst = curve_rel.argmax()
     k_norm = np.sort(np.r_[k_curve, close_to_resonances(k_min, k_max)])
-    norm_u = l2(u_exact_many(xs, k_norm), axis=0)
+    norm_u = l2(u_exact_many(xs, k_norm, eta, forcing), axis=0)
     norm_nn = l2(on_grid(net, xs, k_norm), axis=0)
 
     if verbose:
@@ -438,7 +473,7 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
         print(f"solution norm    exact max {norm_u.max():.3e} at k = {k_norm[norm_u.argmax()] / np.pi:.6f}pi"
               f"   PINN max {norm_nn.max():.3e} at k = {k_norm[norm_nn.argmax()] / np.pi:.4f}pi")
 
-    tag = config_tag(mu, hard_bc, scale_k, optimizer, mu_auto)
+    tag = config_tag(mu, hard_bc, scale_k, optimizer, mu_auto, forcing)
     stem = (f"param_k{k_min / np.pi:g}-{k_max / np.pi:g}_{tag}"
             + (f"_n{n_coll}" if n_coll != N_COLLOCATION else "")
             + (f"_focus{focus:g}" if focus > 0 else ""))
@@ -461,15 +496,26 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
               fig.add_subplot(gs[1, 0:3]), fig.add_subplot(gs[1, 3:6])]
 
         a = ax[0]
-        a.plot(xs, u_ex, color=INK, lw=2, label="real (exact Fourier)")
-        a.plot(xs, u_nn, color=BLUE, lw=2, ls="--", label="tested (PINN)")
+        if n_out == 1:
+            a.plot(xs, u_ex, color=INK, lw=2, label="real (exact Fourier)")
+            a.plot(xs, u_nn, color=BLUE, lw=2, ls="--", label="tested (PINN)")
+        else:
+            a.plot(xs, u_ex.real, color=INK, lw=2, label="Re u (exact)")
+            a.plot(xs, u_ex.imag, color=MUTED, lw=2, label="Im u (exact)")
+            a.plot(xs, u_nn.real, color=BLUE, lw=2, ls="--", label="Re u (PINN)")
+            a.plot(xs, u_nn.imag, color=ORANGE, lw=2, ls="--", label="Im u (PINN)")
         a.set_xlabel("x")
         a.set_ylabel("u(x)")
         a.set_title(f"test k = {k_test / np.pi:.4f}π   ({test_kind}, not a training point)")
         a.legend(loc="best")
 
         a = ax[1]
-        a.plot(xs, err, color=BLUE, lw=1.5)
+        if n_out == 1:
+            a.plot(xs, err, color=BLUE, lw=1.5)
+        else:
+            a.plot(xs, err.real, color=BLUE, lw=1.5, label="real part")
+            a.plot(xs, err.imag, color=ORANGE, lw=1.5, label="imaginary part")
+            a.legend(loc="best")
         a.axhline(0, color=MUTED, lw=0.6)
         a.set_xlabel("x")
         a.set_ylabel("u_exact - u_PINN")
@@ -527,7 +573,7 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
 
         fig.suptitle(f"NN(x, k) trained on {k_min / np.pi:g}π ≤ k ≤ {k_max / np.pi:g}π     "
                      f"({config_label(mu, hard_bc, scale_k, optimizer, mu_auto)},  "
-                     f"{points.replace('pi', 'π')})", fontsize=13)
+                     f"{points.replace('pi', 'π')},  forcing {FORCING_LABEL[forcing]})", fontsize=13)
         plt.tight_layout()
         path = f"figures/{stem}_test{k_test / np.pi:.4f}.png"
         plt.savefig(path, dpi=140)
@@ -555,6 +601,7 @@ if __name__ == "__main__":
     p.add_argument("--focus", type=float, default=FOCUS)
     p.add_argument("--focus-width", type=float, default=FOCUS_WIDTH)
     p.add_argument("--raw-k", action="store_true")
+    p.add_argument("--forcing", choices=["real", "imag"], default=FORCING)
     p.add_argument("--optimizer", choices=["lm", "adam"], default=OPTIMIZER)
     p.add_argument("--mu", type=mu_arg, default=MU)
     p.add_argument("--hard-bc", action="store_true", default=HARD_BC)
@@ -570,4 +617,4 @@ if __name__ == "__main__":
         focus=a.focus, focus_width=a.focus_width * np.pi,
         mu=a.mu, scale_k=not a.raw_k, hard_bc=a.hard_bc, optimizer=a.optimizer,
         lm_iter=a.lm_iter, n_iter=a.n_iter, lbfgs_iter=a.lbfgs_iter, width=a.width,
-        depth=a.depth, seed=a.seed)
+        depth=a.depth, seed=a.seed, forcing=a.forcing)
