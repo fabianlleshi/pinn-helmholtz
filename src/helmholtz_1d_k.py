@@ -69,10 +69,12 @@ def forcing_torch(x, k, forcing="real"):
         return f, torch.zeros_like(f)
     if forcing == "imag":
         return torch.zeros_like(f), f
+    if forcing == "harmonic":
+        return f * torch.cos(k * x), f * torch.sin(k * x)
     raise ValueError(forcing)
 
 
-FORCING_LABEL = {"real": "f(x)", "imag": "i·f(x)"}
+FORCING_LABEL = {"real": "f(x)", "imag": "i·f(x)", "harmonic": "f(x)·exp(ikx)"}
 
 
 def sine_coefficients(values):
@@ -601,7 +603,7 @@ if __name__ == "__main__":
     p.add_argument("--focus", type=float, default=FOCUS)
     p.add_argument("--focus-width", type=float, default=FOCUS_WIDTH)
     p.add_argument("--raw-k", action="store_true")
-    p.add_argument("--forcing", choices=["real", "imag"], default=FORCING)
+    p.add_argument("--forcing", choices=["real", "imag", "harmonic"], default=FORCING)
     p.add_argument("--optimizer", choices=["lm", "adam"], default=OPTIMIZER)
     p.add_argument("--mu", type=mu_arg, default=MU)
     p.add_argument("--hard-bc", action="store_true", default=HARD_BC)
