@@ -25,6 +25,7 @@ N_BOUNDARY = 50
 FOCUS = 0.0
 FOCUS_WIDTH = 0.1
 FORCING = "real"
+ETA = 0.0
 SCALE_K = True
 OPTIMIZER = "lm"
 MU = "auto"
@@ -118,8 +119,8 @@ def u_exact_many(x, ks, eta=0.0, forcing="real"):
     return np.sin(np.outer(x, n * np.pi)) @ coeffs
 
 
-def nearest_resonance(k):
-    gaps = np.abs(n**2 * np.pi**2 - k**2)
+def nearest_resonance(k, eta=0.0):
+    gaps = np.abs(n**2 * np.pi**2 - (k**2 if eta == 0 else (k - 1j * eta)**2))
     i = gaps.argmin()
     return int(n[i]), gaps[i]
 
@@ -132,9 +133,10 @@ def l2(values, axis=None):
     return np.sqrt(np.mean(np.abs(values)**2, axis=axis))
 
 
-def config_tag(mu, hard_bc, scale_k, optimizer, mu_auto, forcing="real"):
+def config_tag(mu, hard_bc, scale_k, optimizer, mu_auto, forcing="real", eta=0.0):
     bc = "hard" if hard_bc else ("muauto" if mu_auto else f"mu{mu:g}")
-    return f"{bc}_{'kscaled' if scale_k else 'kraw'}_{optimizer}" + ("" if forcing == "real" else f"_{forcing}")
+    return (f"{bc}_{'kscaled' if scale_k else 'kraw'}_{optimizer}" + ("" if forcing == "real" else f"_{forcing}")
+            + (f"_eta{eta:g}" if eta > 0 else ""))
 
 
 def config_label(mu, hard_bc, scale_k, optimizer, mu_auto, ascii=False):
@@ -337,7 +339,7 @@ def train_lm(net, X, Xb, mu, mu_auto, hard_bc, lm_iter, verbose, eta=0.0, forcin
 def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOCATION,
         n_bc=N_BOUNDARY, focus=FOCUS, focus_width=FOCUS_WIDTH * np.pi, mu=MU, scale_k=SCALE_K,
         hard_bc=HARD_BC, optimizer=OPTIMIZER, lm_iter=LM_ITER, n_iter=N_ITER,
-        lbfgs_iter=LBFGS_ITER, width=WIDTH, depth=DEPTH, seed=SEED, forcing=FORCING, eta=0.0,
+        lbfgs_iter=LBFGS_ITER, width=WIDTH, depth=DEPTH, seed=SEED, forcing=FORCING, eta=ETA,
         verbose=True, plot=True):
     mu_auto = mu == "auto"
     mu = 0.0 if mu_auto else float(mu)
@@ -351,6 +353,7 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
     if k_test is None:
         k_test = np.random.default_rng().uniform(k_min, k_max)
     res_in = resonances_in(k_min, k_max)
+    res_label = "resonances" if eta == 0 else "nπ, the poles are at nπ + iη"
     points = f"n_coll = {n_coll}" + (f" ({focus:.0%} within {focus_width / np.pi:g}pi of a resonance)"
                                       if focus > 0 else "")
 
@@ -363,7 +366,11 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
         print(f"{config_label(mu, hard_bc, scale_k, optimizer, mu_auto, ascii=True)}   "
               f"{points}   n_bc = {n_bc}   width = {width}   depth = {depth}   {steps}")
         print(f"forcing {FORCING_LABEL[forcing].replace('·', '*')}"
-              + ("   complex solution: the network outputs Re u and Im u" if n_out == 2 else "") + "\n")
+              + ("   complex solution: the network outputs Re u and Im u" if n_out == 2 else ""))
+        if eta > 0:
+            print(f"absorption eta = {eta:g}: -u'' - (k - i*eta)^2 u = f, the poles move to n*pi + i*eta, "
+                  f"so no real resonances")
+        print()
 
     hist_lbfgs = []
     lm_iters = 0
@@ -416,7 +423,7 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
     loss_final = pde_final + mu * bc_final
 
     xs = np.linspace(0.0, 1.0, 2001)
-    n_star, gap = nearest_resonance(k_test)
+    n_star, gap = nearest_resonance(k_test, eta)
     u_ex = u_exact(xs, k_test, eta, forcing)
     X_test = pairs(xs, k_test)
     res_test = np.abs(as_complex(residual(net, X_test, eta, forcing).detach().numpy())).max()
@@ -462,7 +469,8 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
             k_mid = 0.5 * (k_min + k_max)
             print(f"automatic mu = {mu:.3e}   (= {mu / k_mid**4:.2f} k_mid^4)")
         print(f"\nTEST at k = {k_test / np.pi:.4f}pi   ({test_kind}, not a training point)   "
-              f"nearest resonance n* = {n_star}   gap |n*^2 pi^2 - k^2| = {gap:.4f}")
+              f"nearest resonance n* = {n_star}   gap |n*^2 pi^2 - "
+              + ("k^2" if eta == 0 else "(k - i*eta)^2") + f"| = {gap:.4f}")
         print(f"size of u        L2 = {u_l2:.3e}   max = {u_max:.3e}")
         print(f"error            L2 = {err_l2:.3e}   max = {err_max:.3e}   "
               f"relative = {rel_err:.3e}")
@@ -475,7 +483,7 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
         print(f"solution norm    exact max {norm_u.max():.3e} at k = {k_norm[norm_u.argmax()] / np.pi:.6f}pi"
               f"   PINN max {norm_nn.max():.3e} at k = {k_norm[norm_nn.argmax()] / np.pi:.4f}pi")
 
-    tag = config_tag(mu, hard_bc, scale_k, optimizer, mu_auto, forcing)
+    tag = config_tag(mu, hard_bc, scale_k, optimizer, mu_auto, forcing, eta)
     stem = (f"param_k{k_min / np.pi:g}-{k_max / np.pi:g}_{tag}"
             + (f"_n{n_coll}" if n_coll != N_COLLOCATION else "")
             + (f"_focus{focus:g}" if focus > 0 else ""))
@@ -484,7 +492,7 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
         w = csv.writer(fh)
         w.writerow(["kpi", "k", "n_star", "gap", "u_l2", "nn_l2", "err_l2", "rel_err", "test"])
         for kc, ul, nl, el, rl in zip(k_curve, curve_u, curve_nn, curve_err, curve_rel):
-            ns, gp = nearest_resonance(kc)
+            ns, gp = nearest_resonance(kc, eta)
             w.writerow([kc / np.pi, kc, ns, gp, ul, nl, el, rl, 0])
         w.writerow([k_test / np.pi, k_test, n_star, gap, u_l2, l2(u_nn), err_l2, rel_err, 1])
     if verbose:
@@ -544,7 +552,7 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
         for m in res_in:
             a.axvline(m, color=MUTED, lw=0.8, ls="--")
         a.semilogy([k_test / np.pi], [rel_err], "o", color=ORANGE, ms=9)
-        a.set_xlabel("k / π" + ("     (dashed: resonances)" if res_in else ""))
+        a.set_xlabel("k / π" + (f"     (dashed: {res_label})" if res_in else ""))
         a.set_ylabel("relative error  ‖u − û‖ / ‖u‖")
         a.set_title(f"error across the k range,  median {np.median(curve_rel):.2e}  "
                     f"(orange: test k)")
@@ -563,7 +571,7 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
         a.semilogy(k_norm / np.pi, norm_nn, "--", color=BLUE, lw=2, label="PINN  ‖û(k)‖")
         for m in res_in:
             a.axvline(m, color=MUTED, lw=0.8, ls="--")
-        a.set_xlabel("k / π" + ("     (dashed: resonances)" if res_in else ""))
+        a.set_xlabel("k / π" + (f"     (dashed: {res_label})" if res_in else ""))
         a.set_ylabel("L2 norm over x")
         a.set_title(f"solution size across k,  max ‖û‖ = {norm_nn.max():.2e},  "
                     f"max ‖u‖ = {norm_u.max():.2e}")
@@ -575,7 +583,8 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
 
         fig.suptitle(f"NN(x, k) trained on {k_min / np.pi:g}π ≤ k ≤ {k_max / np.pi:g}π     "
                      f"({config_label(mu, hard_bc, scale_k, optimizer, mu_auto)},  "
-                     f"{points.replace('pi', 'π')},  forcing {FORCING_LABEL[forcing]})", fontsize=13)
+                     f"{points.replace('pi', 'π')},  forcing {FORCING_LABEL[forcing]}"
+                     + (f",  absorption η = {eta:g}" if eta > 0 else "") + ")", fontsize=13)
         plt.tight_layout()
         path = f"figures/{stem}_test{k_test / np.pi:.4f}.png"
         plt.savefig(path, dpi=140)
@@ -604,6 +613,7 @@ if __name__ == "__main__":
     p.add_argument("--focus-width", type=float, default=FOCUS_WIDTH)
     p.add_argument("--raw-k", action="store_true")
     p.add_argument("--forcing", choices=["real", "imag", "harmonic"], default=FORCING)
+    p.add_argument("--eta", type=float, default=ETA)
     p.add_argument("--optimizer", choices=["lm", "adam"], default=OPTIMIZER)
     p.add_argument("--mu", type=mu_arg, default=MU)
     p.add_argument("--hard-bc", action="store_true", default=HARD_BC)
@@ -619,4 +629,4 @@ if __name__ == "__main__":
         focus=a.focus, focus_width=a.focus_width * np.pi,
         mu=a.mu, scale_k=not a.raw_k, hard_bc=a.hard_bc, optimizer=a.optimizer,
         lm_iter=a.lm_iter, n_iter=a.n_iter, lbfgs_iter=a.lbfgs_iter, width=a.width,
-        depth=a.depth, seed=a.seed, forcing=a.forcing)
+        depth=a.depth, seed=a.seed, forcing=a.forcing, eta=a.eta)
