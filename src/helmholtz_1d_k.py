@@ -352,6 +352,8 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
     test_kind = "random" if k_test is None else "chosen"
     if k_test is None:
         k_test = np.random.default_rng().uniform(k_min, k_max)
+    if eta == 0 and nearest_resonance(k_test)[1] < 1e-9:
+        raise ValueError(f"k = {k_test / np.pi:g}pi is a resonance: without absorption there is no solution there")
     res_in = resonances_in(k_min, k_max)
     res_label = "resonances" if eta == 0 else "nπ, the poles are at nπ + iη"
     points = f"n_coll = {n_coll}" + (f" ({focus:.0%} within {focus_width / np.pi:g}pi of a resonance)"
@@ -595,7 +597,81 @@ def run(k_min=K_MIN * np.pi, k_max=K_MAX * np.pi, k_test=K_TEST, n_coll=N_COLLOC
     return dict(k_min=k_min, k_max=k_max, k_test=k_test, n_star=n_star, gap=gap, mu=mu,
                 u_l2=u_l2, err_l2=err_l2, rel_err=rel_err, share_star=share_star,
                 loss_final=loss_final, max_res=res_test, lm_iters=lm_iters,
-                k_curve=k_curve, curve_rel=curve_rel, k_norm=k_norm, norm_u=norm_u, norm_nn=norm_nn)
+                k_curve=k_curve, curve_rel=curve_rel, k_norm=k_norm, norm_u=norm_u, norm_nn=norm_nn,
+                eta=eta, median=float(np.median(curve_rel)), worst=float(curve_rel.max()),
+                max_u=float(norm_u.max()), max_nn=float(norm_nn.max()), res_in=res_in,
+                label=config_label(mu, hard_bc, scale_k, optimizer, mu_auto), n_coll=n_coll, forcing=forcing)
+
+
+def summarize_eta(rows):
+    rows = sorted(rows, key=lambda r: r["eta"])
+    r0 = rows[0]
+    k_min, k_max = r0["k_min"] / np.pi, r0["k_max"] / np.pi
+    stem = f"eta_sweep_k{k_min:g}-{k_max:g}_" + "_".join(f"{r['eta']:g}" for r in rows)
+
+    os.makedirs("results", exist_ok=True)
+    with open(f"results/{stem}.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["eta", "median_rel_err", "worst_rel_err", "k_test_pi", "test_rel_err",
+                    "max_u", "max_nn", "loss_final"])
+        for r in rows:
+            w.writerow([r["eta"], r["median"], r["worst"], r["k_test"] / np.pi, r["rel_err"],
+                        r["max_u"], r["max_nn"], r["loss_final"]])
+
+    print("\n" + "=" * 78)
+    print(f"ABSORPTION SWEEP   {k_min:g}pi <= k <= {k_max:g}pi")
+    print(f"{'eta':>8} {'median err':>11} {'worst err':>10} {'test k/pi':>10} {'test err':>10} "
+          f"{'max ||u||':>10} {'max ||u_hat||':>14}")
+    for r in rows:
+        print(f"{r['eta']:>8g} {r['median']:>11.3e} {r['worst']:>10.3e} {r['k_test'] / np.pi:>10.4f} "
+              f"{r['rel_err']:>10.3e} {r['max_u']:>10.3e} {r['max_nn']:>14.3e}")
+    print(f"\nsaved results/{stem}.csv")
+
+    fig, ax = plt.subplots(1, 3, figsize=(19, 5.8), gridspec_kw=dict(width_ratios=[1.5, 1, 1]))
+    colors = plt.cm.Blues(np.linspace(0.35, 1.0, len(rows)))
+    etas = [f"{r['eta']:g}" for r in rows]
+    pos = np.arange(len(rows))
+
+    a = ax[0]
+    for r, c in zip(rows, colors):
+        a.semilogy(r["k_curve"] / np.pi, r["curve_rel"], "-", color=c, lw=1.8, label=f"η = {r['eta']:g}")
+    for m in r0["res_in"]:
+        a.axvline(m, color=MUTED, lw=0.8, ls="--")
+    a.set_xlabel("k / π     (dashed: nπ)")
+    a.set_ylabel("relative error  ‖u − û‖ / ‖u‖")
+    a.set_title("error across k, one curve per absorption η")
+    a.legend(loc="best")
+
+    a = ax[1]
+    a.semilogy(pos, [r["median"] for r in rows], "o-", color=VIOLET, lw=2, ms=7, label="median over k")
+    a.semilogy(pos, [r["worst"] for r in rows], "s--", color=ORANGE, lw=1.5, ms=6, label="worst k")
+    a.set_ylabel("relative error")
+    a.set_title("error vs absorption")
+    a.legend(loc="best")
+
+    a = ax[2]
+    a.semilogy(pos, [r["max_u"] for r in rows], "o-", color=INK, lw=2, ms=7, label="exact  max ‖u(k)‖")
+    a.semilogy(pos, [r["max_nn"] for r in rows], "s--", color=BLUE, lw=2, ms=7, label="PINN  max ‖û(k)‖")
+    a.set_ylabel("largest L2 norm over the k range")
+    a.set_title("peak solution size vs absorption")
+    a.legend(loc="best")
+
+    for a in ax[1:]:
+        a.set_xticks(pos)
+        a.set_xticklabels(etas)
+        a.set_xlabel("absorption η")
+    for a in ax:
+        a.grid(color=GRID, lw=0.6)
+        a.set_axisbelow(True)
+
+    fig.suptitle(f"Absorption sweep on {k_min:g}π ≤ k ≤ {k_max:g}π     ({r0['label']},  "
+                 f"n_coll = {r0['n_coll']},  forcing {FORCING_LABEL[r0['forcing']]})", fontsize=13)
+    plt.tight_layout()
+    os.makedirs("figures", exist_ok=True)
+    path = f"figures/{stem}.png"
+    plt.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f"saved {path}")
 
 
 def mu_arg(s):
@@ -613,7 +689,7 @@ if __name__ == "__main__":
     p.add_argument("--focus-width", type=float, default=FOCUS_WIDTH)
     p.add_argument("--raw-k", action="store_true")
     p.add_argument("--forcing", choices=["real", "imag", "harmonic"], default=FORCING)
-    p.add_argument("--eta", type=float, default=ETA)
+    p.add_argument("--eta", type=float, nargs="+", default=[ETA])
     p.add_argument("--optimizer", choices=["lm", "adam"], default=OPTIMIZER)
     p.add_argument("--mu", type=mu_arg, default=MU)
     p.add_argument("--hard-bc", action="store_true", default=HARD_BC)
@@ -624,9 +700,12 @@ if __name__ == "__main__":
     p.add_argument("--depth", type=int, default=DEPTH)
     p.add_argument("--seed", type=int, default=SEED)
     a = p.parse_args()
-    run(k_min=a.k_min * np.pi, k_max=a.k_max * np.pi,
-        k_test=None if a.k_test is None else a.k_test * np.pi, n_coll=a.n_coll, n_bc=a.n_bc,
-        focus=a.focus, focus_width=a.focus_width * np.pi,
-        mu=a.mu, scale_k=not a.raw_k, hard_bc=a.hard_bc, optimizer=a.optimizer,
-        lm_iter=a.lm_iter, n_iter=a.n_iter, lbfgs_iter=a.lbfgs_iter, width=a.width,
-        depth=a.depth, seed=a.seed, forcing=a.forcing, eta=a.eta)
+    rows = [run(k_min=a.k_min * np.pi, k_max=a.k_max * np.pi,
+                k_test=None if a.k_test is None else a.k_test * np.pi, n_coll=a.n_coll, n_bc=a.n_bc,
+                focus=a.focus, focus_width=a.focus_width * np.pi,
+                mu=a.mu, scale_k=not a.raw_k, hard_bc=a.hard_bc, optimizer=a.optimizer,
+                lm_iter=a.lm_iter, n_iter=a.n_iter, lbfgs_iter=a.lbfgs_iter, width=a.width,
+                depth=a.depth, seed=a.seed, forcing=a.forcing, eta=eta)
+            for eta in a.eta]
+    if len(rows) > 1:
+        summarize_eta(rows)
